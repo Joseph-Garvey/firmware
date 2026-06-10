@@ -5,6 +5,7 @@
   "files.insertFinalNewline": false,
   "files.trimFinalNewlines": false,
   "cmake.configureOnOpen": false,
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
   "[cpp]": {
     "editor.defaultFormatter": "trunk.io"
   },

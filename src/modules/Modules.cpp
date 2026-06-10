@@ -22,6 +22,9 @@
 #if !MESHTASTIC_EXCLUDE_DETECTIONSENSOR
 #include "modules/DetectionSensorModule.h"
 #endif
+#ifdef SLM_ENABLED
+#include "modules/SoundLevel/SoundLevelModule.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_NEIGHBORINFO
 #include "modules/NeighborInfoModule.h"
 #endif
@@ -188,6 +191,9 @@ void setupModules()
 #endif
     // Example: Put your module here
     // new ReplyModule();
+#ifdef SLM_ENABLED
+    soundLevelModule = new SoundLevelModule();
+#endif
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         cannedMessageModule = new CannedMessageModule();
