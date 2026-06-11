@@ -1,7 +1,9 @@
+#include "configuration.h"
+#if defined(ARCH_ESP32) && defined(SLM_ENABLED)
+
 #include "SoundLevelModule.h"
 #include "MeshService.h"
 #include "airtime.h"
-#include "configuration.h"
 #include "main.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
 
@@ -19,14 +21,14 @@
 // ---------------------------------------------------------------------------
 
 // External PDM mic pins. NOTE: on the seeed_xiao_s3 variant the SX1262 radio
-// already uses GPIO41 (CS) / 42 (RESET) / 7,8,9 (SPI) / 38,39,40, and I2C is on
-// 5/6, GPS on 43/44 — so the mic must sit on otherwise-free GPIOs. Defaults below
-// are D1/D2 (GPIO2/GPIO3) on the standard XIAO ESP32S3.
+// already uses GPIO41 (CS) / 42 (RESET) / 7,8,9 (SPI) / 38,39,40, I2C/Wire is on
+// the variant defaults SDA=47/SCL=48, and GPS is on 43/44 — so the mic must sit on
+// otherwise-free GPIOs. Defaults below are D4/D5 (GPIO5/GPIO6) on the XIAO ESP32S3.
 #ifndef SLM_PDM_CLK_PIN
-#define SLM_PDM_CLK_PIN D5
+#define SLM_PDM_CLK_PIN 6
 #endif
 #ifndef SLM_PDM_DATA_PIN
-#define SLM_PDM_DATA_PIN D4
+#define SLM_PDM_DATA_PIN 5
 #endif
 
 // Base accumulation interval (ms) the audio task folds into the FIFO. The real
@@ -142,6 +144,23 @@ uint8_t dbToU8(float db)
         v = 255;
     return (uint8_t)v;
 }
+
+// Tear down whatever startCapture() managed to bring up, in reverse order. Safe to
+// call at any partial-init point: each step is guarded by its own handle.
+// `enabled` says whether the PDM RX channel was already i2s_channel_enable()d.
+void teardownCapture(bool enabled)
+{
+    if (s_snapQ) {
+        vQueueDelete(s_snapQ);
+        s_snapQ = nullptr;
+    }
+    if (s_rxChan) {
+        if (enabled)
+            i2s_channel_disable(s_rxChan);
+        i2s_del_channel(s_rxChan);
+        s_rxChan = nullptr;
+    }
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -169,8 +188,17 @@ bool SoundLevelModule::startCapture()
             .invert_flags = {.clk_inv = false},
         },
     };
-    if (i2s_channel_init_pdm_rx_mode(s_rxChan, &pdmCfg) != ESP_OK || i2s_channel_enable(s_rxChan) != ESP_OK) {
+    // If init succeeds but enable fails, the channel exists but is not enabled;
+    // pass enabled=false so teardown only deletes it. If both succeed we fall
+    // through with the channel enabled.
+    if (i2s_channel_init_pdm_rx_mode(s_rxChan, &pdmCfg) != ESP_OK) {
         LOG_ERROR("SoundLevel: I2S PDM init failed (clk=%d data=%d)", SLM_PDM_CLK_PIN, SLM_PDM_DATA_PIN);
+        teardownCapture(false);
+        return false;
+    }
+    if (i2s_channel_enable(s_rxChan) != ESP_OK) {
+        LOG_ERROR("SoundLevel: I2S PDM init failed (clk=%d data=%d)", SLM_PDM_CLK_PIN, SLM_PDM_DATA_PIN);
+        teardownCapture(false);
         return false;
     }
     s_bank.begin();
@@ -180,10 +208,12 @@ bool SoundLevelModule::startCapture()
     s_snapQ = xQueueCreate(SLM_SNAP_QUEUE_DEPTH, sizeof(BaseSnap));
     if (!s_snapQ) {
         LOG_ERROR("SoundLevel: queue alloc failed");
+        teardownCapture(true);
         return false;
     }
     if (xTaskCreatePinnedToCore(audioTask, "slmAudio", 4096, nullptr, SLM_AUDIO_PRIO, nullptr, SLM_AUDIO_CORE) != pdPASS) {
         LOG_ERROR("SoundLevel: audio task create failed");
+        teardownCapture(true);
         return false;
     }
     LOG_INFO("SoundLevel: capturing @%.0f Hz, base %lu ms, Tmin %ds, self-duty %.2f%%", (double)OCT_FS0,
@@ -217,23 +247,21 @@ void SoundLevelModule::sendSpectrum()
     const double windowS = (double)s_accBlocks * OCT_BLOCK / OCT_FS0;
     uint16_t windowU16 = windowS >= 65535.0 ? 65535 : (uint16_t)lround(windowS);
 
-    // Wire format (37 bytes): the band centers are the fixed IEC base-10 set, so only
-    // the levels travel. The MQTT bridge knows the band table.
-    //   [0]    version (0x01)
-    //   [1]    nBands (OCT_NUM_BANDS = 31)
-    //   [2..3] window_seconds, uint16 little-endian
-    //   [4]    LAeq, uint8, 0.5 dB/LSB
-    //   [5]    LCeq, uint8, 0.5 dB/LSB
-    //   [6..]  per-band Leq, uint8 each, 0.5 dB/LSB
-    uint8_t buf[6 + OCT_NUM_BANDS];
-    buf[0] = 0x01;
+    // Wire format v2 (35 bytes = 4 + OCT_NUM_BANDS): the band centers are the fixed
+    // IEC base-10 set, so only the levels travel. The MQTT bridge knows the band
+    // table and re-derives A/C-weighted broadband levels from the bands, so no
+    // synthesized LAeq/LCeq is shipped (avoids the double pow() weighting here).
+    //   [0]      version (0x02)
+    //   [1]      nBands (OCT_NUM_BANDS = 31)
+    //   [2..3]   window_seconds, uint16 little-endian
+    //   [4..34]  per-band Leq, uint8 each, 0.5 dB/LSB (OCT_NUM_BANDS entries)
+    uint8_t buf[4 + OCT_NUM_BANDS];
+    buf[0] = 0x02;
     buf[1] = (uint8_t)OCT_NUM_BANDS;
     buf[2] = (uint8_t)(windowU16 & 0xFF);
     buf[3] = (uint8_t)(windowU16 >> 8);
-    buf[4] = dbToU8(OctaveBank::dBAeq(s_accE, s_accBlocks));
-    buf[5] = dbToU8(OctaveBank::dBCeq(s_accE, s_accBlocks));
     for (int b = 0; b < OCT_NUM_BANDS; ++b)
-        buf[6 + b] = dbToU8(OctaveBank::bandLeqDb(s_accE, s_accBlocks, b));
+        buf[4 + b] = dbToU8(OctaveBank::bandLeqDb(s_accE, s_accBlocks, b));
 
     meshtastic_MeshPacket *p = allocDataPacket();   // stamps our port, to=BROADCAST
     p->to = NODENUM_BROADCAST;
@@ -242,8 +270,8 @@ void SoundLevelModule::sendSpectrum()
     p->decoded.payload.size = sizeof(buf);
     memcpy(p->decoded.payload.bytes, buf, sizeof(buf));
 
-    LOG_INFO("SoundLevel: TX %us window, LAeq=%.1f LCeq=%.1f", windowU16,
-             (double)OctaveBank::dBAeq(s_accE, s_accBlocks), (double)OctaveBank::dBCeq(s_accE, s_accBlocks));
+    LOG_INFO("SoundLevel: TX %us window, 31-band spectrum (1kHz=%.1f dB)", windowU16,
+             (double)OctaveBank::bandLeqDb(s_accE, s_accBlocks, 17));
     service->sendToMesh(p);
 
     // Reset the window.
@@ -272,3 +300,5 @@ int32_t SoundLevelModule::runOnce()
     // simply grow while the duty-cycle gate holds us silent (no energy is lost).
     return SLM_BASE_INTERVAL_MS;
 }
+
+#endif // ARCH_ESP32 && SLM_ENABLED
