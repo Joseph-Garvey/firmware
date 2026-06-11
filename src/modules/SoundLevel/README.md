@@ -58,7 +58,7 @@ All of these are overridable via `build_flags` in the variant's
 | `SLM_PDM_DATA_PIN` | 5 | PDM data GPIO |
 | `SLM_BASE_INTERVAL_MS` | 1000 | How often the audio task folds energy into the FIFO. The averaging window is always a whole multiple of this. |
 | `SLM_TMIN_S` | 15 | Minimum averaging window / transmit spacing, in seconds. Bounds the packet rate. |
-| `SLM_MAX_DUTY_PCT` | 1.0 | Self-imposed TX duty cap (% of the last hour), applied on top of Meshtastic's region/channel-utilization gates. Use 1.0 to stay within EU868's 1% sub-band limits (Meshtastic's airtime tracker only models the region-wide 10% figure). |
+| `SLM_MAX_DUTY_PCT` | 2.0 | Self-imposed TX duty cap (% of the last hour), applied on top of Meshtastic's own region/channel-utilization gates. Meshtastic already enforces a "polite" cap of `effectiveDutyCycle * polite_duty_cycle_percent / 100` (e.g. 5% on EU_868) against a tally shared by *all* of the node's traffic — this reserves a fair share of that shared budget for SLM so it doesn't crowd out normal mesh messages. |
 | `SLM_AUDIO_CORE` | 0 | Core the audio capture/DSP task is pinned to. Core 0 keeps it off the Arduino/mesh loop (core 1) — but if this node also runs WiFi/MQTT (which lives on core 0), expect contention. |
 | `SLM_AUDIO_PRIO` | 5 | FreeRTOS priority of the audio task. |
 | `SLM_SNAP_QUEUE_DEPTH` | 8 | Depth of the FIFO between the audio task and `runOnce()`. Drained every base interval, so the default is generous margin. |

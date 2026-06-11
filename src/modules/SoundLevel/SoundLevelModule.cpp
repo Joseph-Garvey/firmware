@@ -43,11 +43,15 @@
 #endif
 
 // Self-imposed duty-cycle cap (% of the last hour we allow OURSELVES to transmit),
-// applied on top of Meshtastic's region gate. Set to 1.0 to stay legal on EU868's
-// 1% sub-bands (Meshtastic only models the single region-wide 10% figure and hops
-// frequencies — it does not distinguish per-channel sub-bands). See header.
+// applied on top of Meshtastic's own gates. Meshtastic's isTxAllowedAirUtil() already
+// enforces a "polite" cap of effectiveDutyCycle * polite_duty_cycle_percent / 100
+// (e.g. 10% * 50% = 5% on EU_868) against utilizationTXPercent() — a tally SHARED
+// across all of this node's traffic (text, position, telemetry, routing, SLM, ...).
+// Without our own cap, SLM could consume that entire shared 5% budget by itself and
+// starve normal mesh traffic. SLM_MAX_DUTY_PCT reserves a fair share of it for SLM,
+// leaving the rest for everything else.
 #ifndef SLM_MAX_DUTY_PCT
-#define SLM_MAX_DUTY_PCT 1.0f
+#define SLM_MAX_DUTY_PCT 2.0f
 #endif
 
 // Which core the audio capture/DSP task is pinned to, and its priority. Core 0 is
@@ -235,8 +239,8 @@ bool SoundLevelModule::dutyAllows()
 {
     if (!airTime)
         return false;
-    // Region gate (EU868 = 10% * polite) + polite channel-utilization gate, then our
-    // own stricter cap measured against the firmware's TX airtime tally for the hour.
+    // Meshtastic's own polite gates (region duty cycle + channel utilization), then our
+    // own fair-share cap measured against the firmware's TX airtime tally for the hour.
     return airTime->isTxAllowedAirUtil() && airTime->isTxAllowedChannelUtil(true) &&
            airTime->utilizationTXPercent() < SLM_MAX_DUTY_PCT;
 }
