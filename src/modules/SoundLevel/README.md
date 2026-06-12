@@ -29,13 +29,20 @@ On builds with a display (`HAS_SCREEN`), the module adds a UI frame to the
 normal screen carousel showing a live meter, refreshed every base interval
 (~1 s) from the most recent interval (independent of the LoRa transmit window):
 
-- the broadband **dBA** level (top-left) and the loudest 1/3-octave band's
-  center frequency (top-right),
-- a horizontal **dBA bar meter**, and
+- the broadband **dBA** level (top-left), a **countdown to the next broadcast**
+  (top-center) and the loudest 1/3-octave band's center frequency (top-right), and
 - the full **31-band 1/3-octave spectrum** as vertical bars, with **100 Hz /
   1 kHz / 10 kHz** frequency anchor ticks labeled along the bottom.
 
-Both the meter and the bars map a fixed 20–100 dB SPL range to the screen. The
+The countdown shows the longer of two waits with predictable timing: the
+`SLM_TMIN_S` averaging window filling (shown in seconds, e.g. `12s`) and the
+duty-cycle TX-percent budget freeing up (shown in whole minutes, e.g. `3m` —
+the same estimate the firmware uses for "send again in N mins"). Channel
+utilization, the remaining transmit gate, depends on other radios' traffic and
+can't be predicted, so once both known gates clear the field shows `TX` while
+that last gate lets the packet out.
+
+The bars map a fixed 20–100 dB SPL range to the screen. The
 frame appears once the mic is capturing (a "Warming up..." placeholder shows
 until the first interval lands) and is omitted entirely if the mic fails to
 start. The displayed levels depend on `MIC_CAL_OFFSET_DB` being calibrated for

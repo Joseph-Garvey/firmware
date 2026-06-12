@@ -1,6 +1,11 @@
 #pragma once
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
+#include "octave_bank.h"
+#if HAS_SCREEN
+#include <OLEDDisplay.h>
+#include <OLEDDisplayUi.h>
+#endif
 
 /**
  * SoundLevelModule — a real-time 1/3-octave sound level meter that broadcasts its
@@ -21,13 +26,24 @@
  * See src/modules/SoundLevel/SoundLevelModule.cpp for the wire format and the
  * duty-cycle math.
  */
-class SoundLevelModule : public SinglePortModule, private concurrency::OSThread
+class SoundLevelModule : public SinglePortModule,
+#if HAS_SCREEN
+                         public Observable<const UIFrameEvent *>,
+#endif
+                         private concurrency::OSThread
 {
   public:
     SoundLevelModule();
 
   protected:
     virtual int32_t runOnce() override;
+
+#if HAS_SCREEN
+    // Live on-device sound-level meter: a dBA bar plus the 1/3-octave spectrum.
+    virtual bool wantUIFrame() override { return captureOk; }
+    virtual Observable<const UIFrameEvent *> *getUIFrameObservable() override { return this; }
+    virtual void drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y) override;
+#endif
 
   private:
     bool startCapture();   // one-time I2S + task bring-up (lazy, on first runOnce)
@@ -36,7 +52,15 @@ class SoundLevelModule : public SinglePortModule, private concurrency::OSThread
     void sendSpectrum();
 
     bool started = false;
+    bool captureOk = false;       // mic is up; gates the UI frame
     uint32_t windowStartMs = 0;   // millis() when the current averaging window opened
+
+#if HAS_SCREEN
+    // Most-recent base interval (~1 s), kept for the live meter. Owned by the
+    // consumer thread (runOnce/drawFrame both run on the main loop, no locks).
+    double dispE[OCT_NUM_BANDS] = {0};
+    uint32_t dispBlocks = 0;
+#endif
 };
 
 extern SoundLevelModule *soundLevelModule;
