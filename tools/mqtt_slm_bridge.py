@@ -79,10 +79,12 @@ def decode_envelope(data, args, out):
         key = (frm, pid)
         if key in seen:
             seen[key] = now  # refresh so a steady stream of dups keeps it pinned
+            save_dedup_state(seen, args.dedup_state)
             if not args.quiet:
                 print(f"  .. {node}: dup packet id={pid:#010x} via {env.gateway_id} -- skipped")
             return
         seen[key] = now
+        save_dedup_state(seen, args.dedup_state)  # survive a restart mid-relay-window
 
     label = args.label_map.get(node)
     tag = f"{node} ({label})" if label else node
@@ -114,7 +116,46 @@ def decode_envelope(data, args, out):
 
 # Picked up automatically when --labels isn't given, so a deployment just drops a
 # slm-labels.json next to this script and it's part of the standard bring-up.
-DEFAULT_LABELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slm-labels.json")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LABELS = os.path.join(_HERE, "slm-labels.json")
+# Dedup cache persisted here so a quick bridge restart mid relay-window still drops
+# the second copy of a packet two gateways both uplinked. Only entries newer than
+# --dedup-ttl matter, so this just bridges restarts shorter than that window.
+DEFAULT_DEDUP_STATE = os.path.join(_HERE, ".slm-dedup-state.json")
+
+
+def load_dedup_state(args):
+    """Restore the recent (from, id) set from disk, dropping anything past the TTL."""
+    seen = {}
+    if not args.dedup_ttl or not args.dedup_state:
+        return seen
+    try:
+        with open(args.dedup_state) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return seen
+    cutoff = time.time() - args.dedup_ttl
+    for k, ts in raw.items():
+        if ts >= cutoff:
+            frm, pid = k.split(":")
+            seen[(int(frm), int(pid))] = ts
+    if seen:
+        print(f"[dedup] restored {len(seen)} recent packet id(s) from "
+              f"{os.path.relpath(args.dedup_state)}")
+    return seen
+
+
+def save_dedup_state(seen, path):
+    """Atomically write the (from, id) -> last-seen map. Best-effort; never fatal."""
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({f"{frm}:{pid}": ts for (frm, pid), ts in seen.items()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a debug bridge shouldn't die because the state file isn't writable
 
 
 def load_labels(args):
@@ -221,6 +262,9 @@ def main():
     ap.add_argument("--dedup-ttl", type=float, default=30.0, metavar="SECS",
                     help="Drop repeat (from,packet-id) frames seen within this window "
                          "(e.g. same broadcast relayed by 2 gateways). 0 disables. Default 30.")
+    ap.add_argument("--dedup-state", default=DEFAULT_DEDUP_STATE, metavar="FILE",
+                    help="Where to persist the dedup cache across restarts "
+                         "(default tools/.slm-dedup-state.json). Empty string disables persistence.")
     ap.add_argument("--labels", metavar="FILE",
                     help='JSON map of node ID -> name, e.g. {"!4f4aece2": "Workshop"}. '
                          "Defaults to tools/slm-labels.json if present.")
@@ -236,6 +280,7 @@ def main():
         args.serial = extra[0]
 
     args.label_map = load_labels(args)
+    decode_envelope._seen = load_dedup_state(args)
     out = make_out(args)
     if args.broker:
         run_broker(args, out)

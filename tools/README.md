@@ -61,7 +61,11 @@ multi-node deployment readable:
   retained/redelivered frames). Set `--dedup-ttl 0` to disable. The TTL just needs
   to exceed the spread between gateways relaying the same packet (seconds); it is
   well under the ≥15s sensor transmit spacing, so legitimate next frames (which
-  carry a *new* id) are never suppressed.
+  carry a *new* id) are never suppressed. The cache is **persisted** to
+  `tools/.slm-dedup-state.json` (override with `--dedup-state FILE`, empty string to
+  disable), so a quick bridge restart mid relay-window still drops the second copy;
+  only entries newer than the TTL are restored. On startup the bridge logs
+  `[dedup] restored N recent packet id(s)` when it picks state back up.
 - **Labels (`tools/slm-labels.json`).** Map raw node IDs to names so the console and
   the republished JSON carry a `label` (e.g. `Workshop`) instead of just `!4f4aece2`.
   The bridge auto-loads `tools/slm-labels.json` if it exists — copy the committed
