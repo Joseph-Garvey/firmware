@@ -1,0 +1,4 @@
+# These carry secrets (WiFi PSK, MQTT password, channel PSK) and per-deployment
+# values — keep them local. The README documents how to recreate them.
+gateway.yaml
+slm-node.yaml
