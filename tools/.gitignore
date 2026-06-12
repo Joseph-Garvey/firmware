@@ -1,0 +1,4 @@
+# Per-deployment node-ID -> name map, auto-loaded by mqtt_slm_bridge.py.
+# Not secret, but deployment-specific -- keep it local; slm-labels.example.json
+# is the committed template.
+slm-labels.json

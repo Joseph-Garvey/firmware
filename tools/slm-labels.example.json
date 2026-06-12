@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to slm-labels.json and edit. Maps each SLM meter's node ID to a human name (use the same name you gave the meter as owner_short in provisioning/slm-node.yaml). The bridge auto-loads slm-labels.json; keys accept '!aabbccdd' or 'aabbccdd'. Find a node's ID from its MQTT topic (.../2/e/<chan>/<!nodeid>) or `meshtastic --info`. The _comment key is ignored.",
+  "!4f4aece2": "Workshop",
+  "!deadbeef": "Loading bay"
+}

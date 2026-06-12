@@ -30,7 +30,7 @@ Examples:
   python mqtt_slm_bridge.py --broker 10.250.0.155 --broker-user slm --broker-pass slmdebug123 \
       --in-root TA/SLM --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 """
-import argparse, json, struct, sys, time
+import argparse, json, os, struct, sys, time
 
 from meshtastic.protobuf import mqtt_pb2, portnums_pb2
 
@@ -64,8 +64,30 @@ def decode_envelope(data, args, out):
     p = pkt.decoded.payload
     frm = getattr(pkt, "from")
     node = f"!{frm:08x}"
+
+    # Dedup: the inner MeshPacket.id is assigned by the *originating* sensor, so
+    # if several gateways hear the same broadcast and each uplinks it (or a frame
+    # is redelivered/retained), the (from, id) pair repeats. Squelch those within
+    # a short TTL window. id==0 means "unset" -- can't dedup, let it through.
+    pid = getattr(pkt, "id", 0)
+    if args.dedup_ttl and pid:
+        now = time.time()
+        seen = decode_envelope.__dict__.setdefault("_seen", {})
+        cutoff = now - args.dedup_ttl
+        for k in [k for k, t in seen.items() if t < cutoff]:
+            del seen[k]
+        key = (frm, pid)
+        if key in seen:
+            seen[key] = now  # refresh so a steady stream of dups keeps it pinned
+            if not args.quiet:
+                print(f"  .. {node}: dup packet id={pid:#010x} via {env.gateway_id} -- skipped")
+            return
+        seen[key] = now
+
+    label = args.label_map.get(node)
+    tag = f"{node} ({label})" if label else node
     if len(p) != 35 or p[0] != 0x02:
-        print(f"  !! {node}: not a v2 35-byte SLM frame (len={len(p)} ver={p[0] if p else '?'})")
+        print(f"  !! {tag}: not a v2 35-byte SLM frame (len={len(p)} ver={p[0] if p else '?'})")
         return
     nbands = p[1]
     window = struct.unpack_from("<H", p, 2)[0]
@@ -74,17 +96,55 @@ def decode_envelope(data, args, out):
     peak_hz = CENTERS[levels.index(peak)]
 
     if not args.quiet:
-        print(f"\n=== {node}  ch={env.channel_id}  window={window}s  "
+        print(f"\n=== {tag}  ch={env.channel_id}  window={window}s  "
               f"1kHz={levels[17]:.1f}dB  peak={peak:.1f}dB @ {fmt_hz(peak_hz)}Hz ===")
         for b in range(nbands):
             print(f"   {fmt_hz(CENTERS[b]):>6}Hz {levels[b]:5.1f} |{'#' * int(levels[b] / 2)}")
 
     if out is not None:
+        # retain=True so a fresh subscriber (e.g. the dashboard) gets the last
+        # frame immediately instead of waiting ~15s for the next uplink.
         out.publish(f"{args.out_root}/decoded/{node}",
-                    json.dumps({"node": node, "channel": env.channel_id,
+                    json.dumps({"node": node, "label": label, "channel": env.channel_id,
                                 "window_s": window, "bands_hz": CENTERS,
-                                "levels_db": levels, "peak_db": peak, "peak_hz": peak_hz}))
+                                "levels_db": levels, "peak_db": peak, "peak_hz": peak_hz}),
+                    retain=args.retain)
     decode_envelope.count = getattr(decode_envelope, "count", 0) + 1
+
+
+# Picked up automatically when --labels isn't given, so a deployment just drops a
+# slm-labels.json next to this script and it's part of the standard bring-up.
+DEFAULT_LABELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slm-labels.json")
+
+
+def load_labels(args):
+    """Build a node-id -> human label map from a JSON file and/or inline --label flags.
+
+    Keys are normalized to the `!aabbccdd` form used for `node`, so the file can use
+    either `!a1b2c3d4` or `a1b2c3d4`. Inline --label entries win over the file. With
+    no --labels flag, tools/slm-labels.json is auto-loaded if present.
+    """
+    def norm(k):
+        k = k.strip().lower()
+        return k if k.startswith("!") else "!" + k
+
+    m = {}
+    path = args.labels or (DEFAULT_LABELS if os.path.exists(DEFAULT_LABELS) else None)
+    if path:
+        with open(path) as f:
+            for k, v in json.load(f).items():
+                if k.startswith("_"):
+                    continue  # _comment etc. -- documentation keys, not nodes
+                m[norm(k)] = v
+        print(f"[labels] loaded {os.path.relpath(path)}")
+    for item in args.label or []:
+        if "=" not in item:
+            sys.exit(f"--label expects NODE=Name, got {item!r}")
+        k, v = item.split("=", 1)
+        m[norm(k)] = v
+    if m:
+        print(f"[labels] {len(m)} node label(s): " + ", ".join(f"{k}={v}" for k, v in m.items()))
+    return m
 
 
 def make_out(args):
@@ -157,11 +217,25 @@ def main():
     ap.add_argument("--out-user"); ap.add_argument("--out-pass")
     ap.add_argument("--out-root", default="TA/SLM", help="Republish root, default TA/SLM -> TA/SLM/decoded/<node>")
     ap.add_argument("--quiet", action="store_true", help="No ASCII spectrum, just republish")
+    # multi-node fan-in: dedup overlapping gateway uplinks, label nodes by ID
+    ap.add_argument("--dedup-ttl", type=float, default=30.0, metavar="SECS",
+                    help="Drop repeat (from,packet-id) frames seen within this window "
+                         "(e.g. same broadcast relayed by 2 gateways). 0 disables. Default 30.")
+    ap.add_argument("--labels", metavar="FILE",
+                    help='JSON map of node ID -> name, e.g. {"!4f4aece2": "Workshop"}. '
+                         "Defaults to tools/slm-labels.json if present.")
+    ap.add_argument("--label", action="append", metavar="NODE=Name",
+                    help="Inline node label (repeatable); overrides --labels file")
+    ap.add_argument("--retain", dest="retain", action="store_true", default=True,
+                    help="Publish decoded frames with the MQTT retain flag (default on)")
+    ap.add_argument("--no-retain", dest="retain", action="store_false",
+                    help="Publish without retain (last frame won't be held by the broker)")
     # allow --serial to consume the next arg as a port when given as `--serial /dev/...`
     args, extra = ap.parse_known_args()
     if args.serial is None and extra and not extra[0].startswith("-"):
         args.serial = extra[0]
 
+    args.label_map = load_labels(args)
     out = make_out(args)
     if args.broker:
         run_broker(args, out)

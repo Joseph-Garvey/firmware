@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SLM live spectrum</title>
+<!--
+  Live SoundLevelModule dashboard.
+  Subscribes over MQTT-WebSockets to the decoded JSON the bridge republishes
+  (tools/mqtt_slm_bridge.py -> TA/SLM/decoded/<node>) and draws the 31-band
+  1/3-octave spectrum as it arrives (~every 15s).
+
+  Serve it (browsers won't load mqtt.js over file://):
+    cd tools && python3 -m http.server 8000
+    open http://127.0.0.1:8000/slm_dashboard.html
+  Needs the mosquitto WebSockets listener (listener 9001 / protocol websockets).
+-->
+<style>
+  :root {
+    --bg:#0c0e14; --panel:#141821; --ink:#e7ecf3; --dim:#7b8698;
+    --grid:#222838; --accent:#46e0c0; --warn:#ffb454; --bad:#ff5d6c;
+    --font: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--font); -webkit-font-smoothing:antialiased;
+    display:flex; flex-direction:column; min-height:100vh;
+  }
+  header {
+    display:flex; align-items:baseline; gap:1rem; flex-wrap:wrap;
+    padding:14px 20px; border-bottom:1px solid var(--grid); background:var(--panel);
+  }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; font-weight:600; }
+  .node { color:var(--dim); font-size:13px; }
+  .status { margin-left:auto; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--dim); }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); box-shadow:0 0 8px currentColor; color:var(--bad); }
+  .dot.live { background:var(--accent); color:var(--accent); }
+  .stats { display:flex; gap:28px; padding:12px 20px; flex-wrap:wrap; }
+  .stat { display:flex; flex-direction:column; gap:2px; }
+  .stat .k { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px; }
+  .stat .v { font-size:22px; font-weight:600; }
+  .stat .v small { font-size:13px; color:var(--dim); font-weight:400; }
+  main { flex:1; padding:8px 12px 20px; }
+  canvas { width:100%; height:100%; display:block; }
+  footer { padding:8px 20px; font-size:11px; color:var(--dim); border-top:1px solid var(--grid); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>SLM &middot; LIVE SPECTRUM</h1>
+    <span class="node" id="node">waiting for first frame&hellip;</span>
+    <div class="status"><span class="dot" id="dot"></span><span id="conn">connecting&hellip;</span></div>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><span class="k">1 kHz</span><span class="v" id="s-1k">&mdash; <small>dB</small></span></div>
+    <div class="stat"><span class="k">Peak</span><span class="v" id="s-peak">&mdash; <small>dB</small></span></div>
+    <div class="stat"><span class="k">Peak band</span><span class="v" id="s-peakhz">&mdash;</span></div>
+    <div class="stat"><span class="k">Window</span><span class="v" id="s-win">&mdash; <small>s</small></span></div>
+    <div class="stat"><span class="k">Last frame</span><span class="v" id="s-age">&mdash;</span></div>
+  </div>
+
+  <main><canvas id="spectrum"></canvas></main>
+  <footer id="foot">ws://127.0.0.1:9001 &middot; TA/SLM/decoded/#</footer>
+
+<!-- mqtt.js vendored locally (pinned mqtt@5.10.1) — no CDN dependency, works offline. -->
+<script src="mqtt.min.js"></script>
+<script>
+// ---- config -------------------------------------------------------------
+const WS_URL = "ws://127.0.0.1:9001";
+const TOPIC  = "TA/SLM/decoded/#";
+const DB_MIN = 20, DB_MAX = 90;          // y-axis range
+// Broker credentials are NOT embedded here. They come from an untracked
+// dashboard-config.json (gitignored) if present, else a one-time prompt cached
+// in sessionStorage. See tools/dashboard-config.example.json.
+async function loadAuth(){
+  try {
+    const r = await fetch("dashboard-config.json", { cache: "no-store" });
+    if (r.ok) return await r.json();           // { username, password }
+  } catch (_) { /* no config file -- fall through to prompt */ }
+  const cached = sessionStorage.getItem("slm_auth");
+  if (cached) return JSON.parse(cached);
+  const username = prompt("MQTT username", "slm") || "";
+  const password = prompt("MQTT password") || "";
+  const auth = { username, password };
+  sessionStorage.setItem("slm_auth", JSON.stringify(auth));
+  return auth;
+}
+// ------------------------------------------------------------------------
+
+const cv = document.getElementById("spectrum");
+const ctx = cv.getContext("2d");
+let last = null, lastAt = 0;
+
+function fmtHz(hz){ return hz >= 1000 ? (hz/1000).toLocaleString(undefined,{maximumFractionDigits:2})+"k" : String(hz); }
+function barColor(db){
+  // green -> amber -> red as level climbs
+  const t = Math.max(0, Math.min(1, (db - DB_MIN) / (DB_MAX - DB_MIN)));
+  const hue = 160 - t * 160;             // 160 (teal) down to 0 (red)
+  return `hsl(${hue}, 75%, 55%)`;
+}
+
+function resize(){
+  const r = cv.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+function draw(){
+  const W = cv.clientWidth, H = cv.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  const padL = 44, padR = 12, padT = 10, padB = 34;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const y = db => padT + plotH * (1 - (db - DB_MIN) / (DB_MAX - DB_MIN));
+
+  // gridlines + dB labels
+  ctx.font = "11px ui-monospace, monospace"; ctx.textBaseline = "middle";
+  for (let db = DB_MIN; db <= DB_MAX; db += 10){
+    const yy = y(db);
+    ctx.strokeStyle = "#222838"; ctx.beginPath();
+    ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    ctx.fillStyle = "#7b8698"; ctx.textAlign = "right";
+    ctx.fillText(db, padL - 6, yy);
+  }
+  if (!last) return;
+
+  const bands = last.bands_hz, levels = last.levels_db, n = bands.length;
+  const slot = plotW / n, bw = slot * 0.72;
+  ctx.textBaseline = "alphabetic";
+  for (let i = 0; i < n; i++){
+    const db = levels[i];
+    const x = padL + i * slot + (slot - bw) / 2;
+    const top = y(db), base = y(DB_MIN);
+    ctx.fillStyle = barColor(db);
+    ctx.fillRect(x, top, bw, base - top);
+    // highlight the peak band
+    if (bands[i] === last.peak_hz){
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x - 0.5, top - 0.5, bw + 1, base - top + 1);
+    }
+    // sparse x labels (every 3rd band + the 1kHz anchor) to avoid clutter
+    if (i % 3 === 0 || bands[i] === 1000){
+      ctx.save(); ctx.translate(x + bw/2, base + 6); ctx.rotate(-Math.PI/4);
+      ctx.fillStyle = bands[i] === 1000 ? "#e7ecf3" : "#7b8698";
+      ctx.font = "10px ui-monospace, monospace"; ctx.textAlign = "right";
+      ctx.fillText(fmtHz(bands[i]), 0, 0); ctx.restore();
+    }
+  }
+}
+
+function update(msg){
+  last = msg; lastAt = Date.now();
+  document.getElementById("node").textContent =
+    `node ${msg.node} · ch ${msg.channel} · ${msg.bands_hz.length} bands`;
+  const oneK = msg.levels_db[msg.bands_hz.indexOf(1000)];
+  document.getElementById("s-1k").innerHTML   = `${oneK?.toFixed(1) ?? "—"} <small>dB</small>`;
+  document.getElementById("s-peak").innerHTML = `${msg.peak_db.toFixed(1)} <small>dB</small>`;
+  document.getElementById("s-peakhz").textContent = `${fmtHz(msg.peak_hz)} Hz`;
+  document.getElementById("s-win").innerHTML  = `${msg.window_s} <small>s</small>`;
+  draw();
+}
+
+// age ticker
+setInterval(() => {
+  const el = document.getElementById("s-age");
+  if (!lastAt){ el.textContent = "—"; return; }
+  const s = Math.round((Date.now() - lastAt) / 1000);
+  el.textContent = s < 60 ? `${s}s ago` : `${Math.floor(s/60)}m${s%60}s ago`;
+  // go stale-amber if no frame in >40s (expected cadence ~15s)
+  el.style.color = s > 40 ? "var(--warn)" : "var(--ink)";
+}, 1000);
+
+// ---- MQTT ---------------------------------------------------------------
+const dot = document.getElementById("dot"), conn = document.getElementById("conn");
+function setConn(live, text){ dot.classList.toggle("live", live); conn.textContent = text; }
+
+(async () => {
+  const auth = await loadAuth();
+  const client = mqtt.connect(WS_URL, { ...auth, reconnectPeriod: 2000, connectTimeout: 8000 });
+  client.on("connect", () => { setConn(true, "live"); client.subscribe(TOPIC); });
+  client.on("reconnect", () => setConn(false, "reconnecting…"));
+  client.on("close",     () => setConn(false, "disconnected"));
+  client.on("error", e => { setConn(false, "error"); document.getElementById("foot").textContent = "MQTT error: " + e.message; });
+  client.on("message", (topic, payload) => {
+    try { update(JSON.parse(payload.toString())); }
+    catch (e) { console.warn("bad frame on", topic, e); }
+  });
+})();
+
+resize();
+</script>
+</body>
+</html>

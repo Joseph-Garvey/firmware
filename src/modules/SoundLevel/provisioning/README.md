@@ -23,7 +23,9 @@ Add `--port /dev/cu.usbmodemXXXX` (or `--host <ip>`) to target a specific device
 
 - **gateway.yaml**: replace `password: REPLACE_WITH_MQTT_PASSWORD` with the real
   password for broker user `slm`. The WiFi PSK is already filled in.
-- **slm-node.yaml**: give each meter a unique `owner` / `owner_short`.
+- **slm-node.yaml**: give each meter a unique `owner` / `owner_short`. Reuse that
+  short name in `tools/slm-labels.json` (keyed by node ID) so the MQTT bridge tags
+  decoded frames by name instead of raw `!<nodeid>`.
 - These files contain secrets (WiFi PSK, MQTT password) — keep real values out of
   git.
 

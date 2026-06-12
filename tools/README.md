@@ -6,6 +6,8 @@ packets off the mesh and turn them into readable dB values on MQTT.
 - [mqtt_slm_bridge.py](mqtt_slm_bridge.py) — decode + republish bridge (this is the
   `tools/mqtt_slm_bridge.py` referenced by the broker config).
 - [mosquitto-slm.conf](mosquitto-slm.conf) — local broker config.
+- [slm_dashboard.html](slm_dashboard.html) — live browser spectrum view (see
+  [Live dashboard](#live-dashboard) below). `mqtt.min.js` is vendored alongside it.
 - Device provisioning (the gateway + meter side) lives in
   [../src/modules/SoundLevel/provisioning/](../src/modules/SoundLevel/provisioning/).
 - Wire format + on-device behavior: [../src/modules/SoundLevel/README.md](../src/modules/SoundLevel/README.md).
@@ -42,7 +44,39 @@ packets off the mesh and turn them into readable dB values on MQTT.
                  ▼                              ▼
         ASCII spectrum (console)      JSON → local broker
                                       TA/SLM/decoded/<!node>
-                                      {node,channel,window_s,bands_hz,levels_db,peak_db,peak_hz}
+                                      {node,label,channel,window_s,bands_hz,levels_db,peak_db,peak_hz}
+```
+
+## Multiple sensors / multiple gateways
+
+The bridge fans in any number of sensors automatically — every frame is keyed by
+its source node ID (the `from` in the MeshPacket), so N sensors land on N distinct
+`TA/SLM/decoded/<!node>` topics with no per-node setup. Two extras make a
+multi-node deployment readable:
+
+- **Dedup (`--dedup-ttl`, default 30s).** If more than one gateway hears the same
+  broadcast, each uplinks it and the bridge would otherwise publish the frame
+  twice. The originating sensor stamps every packet with a `MeshPacket.id`, so the
+  bridge drops any repeat `(from, id)` seen within the TTL window (also catches
+  retained/redelivered frames). Set `--dedup-ttl 0` to disable. The TTL just needs
+  to exceed the spread between gateways relaying the same packet (seconds); it is
+  well under the ≥15s sensor transmit spacing, so legitimate next frames (which
+  carry a *new* id) are never suppressed.
+- **Labels (`tools/slm-labels.json`).** Map raw node IDs to names so the console and
+  the republished JSON carry a `label` (e.g. `Workshop`) instead of just `!4f4aece2`.
+  The bridge auto-loads `tools/slm-labels.json` if it exists — copy the committed
+  [slm-labels.example.json](slm-labels.example.json) and edit. Use the same name you
+  gave each meter as `owner_short` in
+  [provisioning/slm-node.yaml](../src/modules/SoundLevel/provisioning/slm-node.yaml).
+  Override the path with `--labels FILE`, or add one-offs with `--label NODE=Name`
+  (these win over the file). The republish topic stays keyed by node ID (stable);
+  the label rides in the payload.
+
+```sh
+cp tools/slm-labels.example.json tools/slm-labels.json    # then edit node IDs -> names
+# bridge picks it up automatically -- no flag needed:
+.venv/bin/python tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemXXXX \
+    --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 ```
 
 **Two transports into the bridge, same decode out of it:**
@@ -73,7 +107,17 @@ meshtastic --port /dev/cu.usbmodemXXXX --configure src/modules/SoundLevel/provis
 meshtastic --port /dev/cu.usbmodemYYYY --configure src/modules/SoundLevel/provisioning/gateway.yaml    # gateway
 ```
 Both must share channel 0's PSK; the gateway needs `uplink_enabled` on channel 0
-and `mqtt.encryption_enabled=false`.
+and `mqtt.encryption_enabled=false`. Give each meter a unique `owner_short` — that's
+the name you'll map to its node ID in the next step.
+
+### 1b. Label the meters (optional but recommended)
+So decoded frames read `Workshop` instead of `!4f4aece2`:
+```sh
+cp tools/slm-labels.example.json tools/slm-labels.json   # then edit: "!<nodeid>": "Name"
+```
+Find each meter's node ID from `meshtastic --info` or its MQTT topic
+(`.../2/e/<chan>/<!nodeid>`). The bridge auto-loads this file (step 4) — no flag
+needed; it's gitignored as per-deployment.
 
 ### 2. Pick a transport on the gateway
 ```sh
@@ -91,6 +135,11 @@ Either way: `mqtt.enabled true`, `mqtt.encryption_enabled false`, `mqtt.root TA/
 mosquitto_passwd -c /opt/homebrew/etc/mosquitto/passwd slm     # one-time, sets the password
 mosquitto -c tools/mosquitto-slm.conf -v                        # leave running
 ```
+The shipped config also opens a **WebSockets listener on 9001** (for the dashboard —
+browsers can't speak raw MQTT/TCP) and enables **persistence** so retained frames
+survive a broker restart. The bridge publishes with `retain=true` (toggle with
+`--no-retain`), so the last spectrum per node is held by the broker and any fresh
+subscriber gets it immediately instead of waiting ~15s for the next uplink.
 
 ### 4. Run the bridge
 ```sh
@@ -109,8 +158,52 @@ mosquitto -c tools/mosquitto-slm.conf -v                        # leave running
 # Readable JSON, one frame:
 mosquitto_sub -h 127.0.0.1 -u slm -P slmdebug123 -t 'TA/SLM/decoded/#' -C 1
 ```
-You should see a frame every ~15s with 31 `levels_db` values. The console also
-prints an ASCII spectrum per frame.
+You should see a frame every ~15s with 31 `levels_db` values, and a `label` field
+carrying the name from `slm-labels.json` (or `null` if the node isn't mapped). The
+console also prints an ASCII spectrum per frame, headed by `!<node> (Label)`. On
+startup the bridge logs `[labels] loaded tools/slm-labels.json` if the file was
+found.
+
+## Live dashboard
+
+[slm_dashboard.html](slm_dashboard.html) is a self-contained browser view of the
+decoded spectrum: a live 31-band bar chart (teal→red by level, peak band outlined)
+with 1 kHz / peak / window / frame-age readouts and a connection indicator. It
+subscribes over **MQTT-over-WebSockets** to the same `TA/SLM/decoded/#` topics the
+bridge republishes — no extra server-side code, just the broker's 9001 listener.
+
+```
+ broker (listener 9001, protocol websockets)
+        │  ws://127.0.0.1:9001   subscribe TA/SLM/decoded/#
+        ▼
+ slm_dashboard.html  ──(mqtt.min.js, vendored)──►  canvas bar chart, ~15s/frame
+```
+
+### Run it
+The page can't be opened over `file://` (the MQTT client won't load), so serve the
+`tools/` dir over HTTP:
+```sh
+cd tools && python3 -m http.server 8000
+open http://127.0.0.1:8000/slm_dashboard.html
+```
+Prerequisites: the broker's WebSockets listener (`listener 9001` / `protocol
+websockets`, already in [mosquitto-slm.conf](mosquitto-slm.conf)) and the bridge
+running so frames flow. Thanks to broker persistence + retained frames, the chart
+paints from the last spectrum on load rather than waiting for the next uplink.
+
+### Credentials
+The broker requires auth, but **no password is embedded in the HTML**. At load the
+page reads `dashboard-config.json` (a `{ "username", "password" }` file, gitignored)
+and falls back to a one-time `prompt()` cached in `sessionStorage` if it's absent.
+Copy [dashboard-config.example.json](dashboard-config.example.json) →
+`dashboard-config.json` with your local broker creds for a no-prompt demo.
+
+### Notes
+- **mqtt.js is vendored** at `tools/mqtt.min.js` (pinned `mqtt@5.10.1`) — no CDN
+  dependency, works offline, no third-party script trust.
+- **Retained ≠ live.** Because frames are retained, the broker serves the last
+  spectrum even after the sensor goes quiet. The "Last frame" readout turns amber
+  after 40s (cadence is ~15s) so a stale retained frame doesn't read as current.
 
 ## Findings / why it's built this way
 

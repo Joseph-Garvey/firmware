@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to dashboard-config.json (gitignored) with your local broker creds. If absent, slm_dashboard.html prompts once and caches in sessionStorage.",
+  "username": "slm",
+  "password": "CHANGE_ME"
+}
