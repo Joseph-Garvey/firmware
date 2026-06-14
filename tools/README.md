@@ -3,11 +3,19 @@
 Consumer-side tooling for the SoundLevelModule: take the raw `PRIVATE_APP` spectrum
 packets off the mesh and turn them into readable dB values on MQTT.
 
-- [mqtt_slm_bridge.py](mqtt_slm_bridge.py) — decode + republish bridge (this is the
-  `tools/mqtt_slm_bridge.py` referenced by the broker config).
+- [mqtt_slm_bridge.py](mqtt_slm_bridge.py) — decode + republish bridge for the **mesh /
+  command-center** path (the `tools/mqtt_slm_bridge.py` referenced by the broker config).
+- [foh_client_bridge.py](foh_client_bridge.py) — decode + republish bridge for the
+  **front-of-house** path: reads the high-rate stream straight off a node's client API
+  (USB / BLE / TCP). See [Front-of-house live stream](#front-of-house-live-stream) below.
+- [slm_frame.py](slm_frame.py) — shared v2-frame decoder (`CENTERS`, `parse_v2`) imported
+  by both bridges. Single source of truth for the band table + wire format.
+- [FOH_INTEGRATION.md](FOH_INTEGRATION.md) — handoff spec for wiring the FoH feed into a
+  separate FoH display app.
 - [mosquitto-slm.conf](mosquitto-slm.conf) — local broker config.
 - [slm_dashboard.html](slm_dashboard.html) — live browser spectrum view (see
   [Live dashboard](#live-dashboard) below). `mqtt.min.js` is vendored alongside it.
+  Works for **both** bridges — same `TA/SLM/decoded/<node>` topic.
 - Device provisioning (the gateway + meter side) lives in
   [../src/modules/SoundLevel/provisioning/](../src/modules/SoundLevel/provisioning/).
 - Wire format + on-device behavior: [../src/modules/SoundLevel/README.md](../src/modules/SoundLevel/README.md).
@@ -167,6 +175,52 @@ carrying the name from `slm-labels.json` (or `null` if the node isn't mapped). T
 console also prints an ASCII spectrum per frame, headed by `!<node> (Label)`. On
 startup the bridge logs `[labels] loaded tools/slm-labels.json` if the file was
 found.
+
+## Front-of-house live stream
+
+Everything above is the **mesh → command-center** path: one integrated frame every
+≥15s, rate-limited by LoRa duty cycle. The **front-of-house** path is different — a
+*live* readout for an engineer standing at the desk — and it doesn't use LoRa or MQTT
+to get there.
+
+A node flashed with the `seeed-xiao-s3-slm-foh` env (build flag `SLM_FOH_STREAM`)
+additionally streams its most-recent spectrum interval to **any locally connected
+client** — USB serial, BLE, or TCP — via the firmware's `MeshService::sendToPhone()`.
+These frames never touch the radio, so they arrive at the configured base-interval
+rate (**8 Hz** by default, 1 Hz if `SLM_BASE_INTERVAL_MS=1000`), not once per window.
+The same node still broadcasts the slow integrated frame to the command center over
+LoRa, unchanged — see *Front-of-house live streaming* in
+[../src/modules/SoundLevel/README.md](../src/modules/SoundLevel/README.md).
+
+[foh_client_bridge.py](foh_client_bridge.py) is the consumer for this path. It connects
+over the client API, decodes the **identical v2 frame** (via the shared
+[slm_frame.py](slm_frame.py)), prints an ASCII spectrum, and — with `--out-broker` —
+republishes the **same `TA/SLM/decoded/<node>` JSON** the MQTT bridge does, so the
+[live dashboard](#live-dashboard) visualizes the FoH feed with zero changes.
+
+```sh
+# Watch live frames over USB (auto-detect port) — no broker needed:
+.venv/bin/python tools/foh_client_bridge.py --serial
+
+# Feed the dashboard from the FoH feed (fully local, no internet):
+.venv/bin/python tools/foh_client_bridge.py --serial \
+    --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
+
+# BLE (pair first) or TCP (WiFi-joined node):
+.venv/bin/python tools/foh_client_bridge.py --ble AA:BB:CC:DD:EE:FF
+.venv/bin/python tools/foh_client_bridge.py --tcp 10.0.0.42
+```
+
+Notes specific to this path:
+- **No dedup, no labels file needed** — a direct client link delivers each frame once,
+  from the one node it's connected to. (The MQTT bridge's multi-gateway dedup is moot here.)
+- The node only streams **while a client is attached** (the firmware gates on the
+  BLE/serial connection), so an idle queue never builds up.
+- `window_s` is sub-second for these instantaneous frames and rounds to `0` — expected;
+  don't treat it as an averaging window.
+- To wire this feed into a **separate FoH display app** (rather than the bundled
+  dashboard), follow [FOH_INTEGRATION.md](FOH_INTEGRATION.md) — it specifies the receive
+  pattern, the decode, and the JSON contract for a clean handoff.
 
 ## Live dashboard
 
