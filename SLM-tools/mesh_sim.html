@@ -16,11 +16,13 @@
     - contention window        CWsize = map(channelUtil,0..100,3..8)            (getTxDelayMsec)
     - SNR-weighted rebroadcast 2*CWmax*slot + rand(0,2^CW)*slot, CW from rx_snr  (getTxDelayMsecWeighted)
     - channel utilization      rolling 60s (6x10s) sum of all heard airtime      (airtime.cpp)
-    - CAD / listen-before-talk defer if channel sensed busy                      (onNotify/isChannelActive)
+    - CAD / listen-before-talk defer if channel sensed busy (needs one slot-time of preamble)
+    - co-SF capture                 FLoRa-style collision window + capture threshold
     - flooding                 dedup (seen-recently), hop-limit decrement,
                                CLIENT cancels rebroadcast on dupe, ROUTER never  (FloodingRouter.cpp)
     - origination cadence      position/telemetry/nodeinfo defaults + the >40
                                node congestion-scaling coefficient              (Default.h/.cpp)
+    - SLM self-throttle        SoundLevelModule::dutyAllows() (polite 25% util + duty + 5% fair-share)
 
   Collision/capture and path-loss are physics the firmware does NOT model; we use
   the standard log-distance + co-SF capture model used by LoRaSim/FLoRa.
@@ -134,11 +136,11 @@
     <label class="row">Capture &Delta; <span class="v" id="capV">6 dB</span><input type="range" id="cap" min="0" max="120" value="60"></label>
 
     <h2>Traffic (TX intervals)</h2>
-    <label class="row">Sensor telem <input type="number" id="iSensor" min="2" max="3600" value="15"> s</label>
+    <label class="row" title="SLM spectrum broadcast cadence (SLM_TMIN_S); self-throttled by dutyAllows()">SLM spectrum <input type="number" id="iSensor" min="2" max="3600" value="15"> s</label>
     <label class="row">Client telem <input type="number" id="iTelem" min="10" max="86400" value="3600"> s</label>
     <label class="row">Position <input type="number" id="iPos" min="10" max="86400" value="3600"> s</label>
     <label class="row">NodeInfo <input type="number" id="iInfo" min="3600" max="172800" value="10800"> s</label>
-    <label class="row">Sensor payload <input type="number" id="payS" min="8" max="230" value="50"> B</label>
+    <label class="row" title="v2 frame = 4 + 31 bands = 35 B (SoundLevelModule::sendSpectrum)">SLM payload <input type="number" id="payS" min="8" max="230" value="35"> B</label>
     <label class="row"><span title="firmware scales client position/telemetry intervals up when >40 nodes are online">Congestion scaling</span>
       <input type="checkbox" id="congest" checked></label>
 
@@ -160,14 +162,16 @@
     <h2>Network</h2>
     <div class="stats">
       <div class="stat"><div class="k">Nodes</div><div class="v" id="m-nodes">0</div></div>
-      <div class="stat"><div class="k">Sensors / GW</div><div class="v" id="m-sg">0/0</div></div>
-      <div class="stat wide"><div class="k">Gateway delivery (PDR)</div><div class="v" id="m-pdr">&mdash; <small>%</small></div></div>
+      <div class="stat"><div class="k">SLM / GW</div><div class="v" id="m-sg">0/0</div></div>
+      <div class="stat wide"><div class="k">Update interval / SLM <small>(target 15s)</small></div><div class="v" id="m-fresh">&mdash; <small>s</small></div></div>
+      <div class="stat wide"><div class="k">Gateway delivery (PDR, of sent)</div><div class="v" id="m-pdr">&mdash; <small>%</small></div></div>
       <div class="stat"><div class="k">Coverage</div><div class="v" id="m-cov">&mdash; <small>%</small></div></div>
       <div class="stat"><div class="k">Offered</div><div class="v" id="m-off">0 <small>/min</small></div></div>
       <div class="stat"><div class="k">Ch. util mean</div><div class="v" id="m-util">0 <small>%</small></div></div>
       <div class="stat"><div class="k">Ch. util max</div><div class="v" id="m-utilmax">0 <small>%</small></div></div>
       <div class="stat"><div class="k">Collisions</div><div class="v" id="m-coll">0 <small>/s</small></div></div>
       <div class="stat"><div class="k">Queue drops</div><div class="v" id="m-drop">0 <small>/s</small></div></div>
+      <div class="stat"><div class="k">Throttle skips</div><div class="v" id="m-skip">0 <small>/min</small></div></div>
       <div class="stat"><div class="k">Mean hops</div><div class="v" id="m-hops">&mdash;</div></div>
       <div class="stat"><div class="k">Latency</div><div class="v" id="m-lat">&mdash; <small>ms</small></div></div>
     </div>
@@ -189,12 +193,20 @@
       <summary>What's modelled &amp; what isn't</summary>
       <div class="note" style="margin-top:6px">
         Faithful to firmware: ToA per preset, slot time, util-driven CW backoff,
-        SNR-weighted rebroadcast delay &amp; router offset, CAD defer, flood dedup +
-        hop decrement, CLIENT dupe-cancel vs ROUTER, &gt;40-node congestion scaling,
-        TX queue cap (16) drops.<br><br>
-        Physics added (not in firmware): log-distance path loss
-        RSSI(d)=sens+10&middot;n&middot;log10(range/d), co-SF capture (&Delta; dB),
-        optional shadowing.<br><br>
+        SNR-weighted rebroadcast delay &amp; router offset, CAD defer (one slot for preamble
+        detect), FLoRa-style preamble collision window, flood dedup + hop decrement,
+        CLIENT dupe-cancel vs ROUTER, &gt;40-node congestion scaling, TX queue cap (16)
+        drops, and the SLM spectrum self-throttle
+        (polite 25% ch-util + EU duty + 5% fair-share, per SoundLevelModule::dutyAllows).
+        An SLM node emits the fixed-cadence spectrum; its Meshtastic role can be set to
+        CLIENT (interval scales with congestion) or SENSOR (priority, no scaling).<br><br>
+        Validated against meshtasticator: sensitivity, slot time, capture threshold,
+        preamble collision window, and CAD slot offset all match lib/config.py and
+        lib/phy.py. Our ToA uses the Semtech/RadioLib formula with coding-rate
+        denominator directly; meshtasticator's airtime() adds 4 again to its config.cr,
+        so its ToA values are ~1.4–1.8&times; higher for the same preset.<br><br>
+        Path loss is parameterized differently here (range + exponent vs. the
+        PTX/LPLD0/GAMMA/D0 model in meshtasticator) but both are log-distance.<br><br>
         Not modelled: DM unicast / NextHop routing, want_ack retransmits, MQTT
         uplink latency, mobility, inter-SF non-orthogonality.
       </div>
@@ -232,18 +244,17 @@ const CWmin = 3, CWmax = 8;   // RadioInterface.h
 const TX_QUEUE_CAP = 16;      // MeshPacketQueue size
 const SEEN_MS = 5*60*1000;    // PacketHistory dedup window
 const NOISE_NF = 6;           // receiver noise figure (dB)
+const SLM_RETRY_MS = 3000;    // throttled SLM node re-checks dutyAllows() ~each base interval; retry cadence
 
-// preset -> {sf, bw(kHz), cr(denominator 5..8)}  (modemPresetToParams, sub-GHz)
+// preset -> {sf, bw(kHz), cr(denominator 5..8), sens(dBm)}  (matches meshtasticator lib/config.py)
 const PRESETS = {
-  ShortTurbo :{sf:7 ,bw:500,cr:5}, ShortFast:{sf:7,bw:250,cr:5}, ShortSlow:{sf:8,bw:250,cr:5},
-  MediumFast :{sf:9 ,bw:250,cr:5}, MediumSlow:{sf:10,bw:250,cr:5},
-  LongFast   :{sf:11,bw:250,cr:5}, LongModerate:{sf:11,bw:125,cr:8}, LongSlow:{sf:12,bw:125,cr:8},
-  LongTurbo  :{sf:11,bw:500,cr:8},
+  ShortTurbo :{sf:7 ,bw:500,cr:5, sens:-118.5}, ShortFast:{sf:7,bw:250,cr:5, sens:-121.5},
+  ShortSlow  :{sf:8 ,bw:250,cr:5, sens:-124.0}, MediumFast:{sf:9,bw:250,cr:5, sens:-126.5},
+  MediumSlow :{sf:10,bw:250,cr:5, sens:-129.0},
+  LongFast   :{sf:11,bw:250,cr:5, sens:-131.5}, LongModerate:{sf:11,bw:125,cr:8, sens:-134.5},
+  LongSlow   :{sf:12,bw:125,cr:8, sens:-137.0}, LongTurbo:{sf:11,bw:500,cr:8, sens:-128.5},
 };
-// SX1262 sensitivity @ BW125 (dBm), per spreading factor
-const SENS125 = {7:-124,8:-127,9:-130,10:-133,11:-135,12:-137};
 
-function sensitivity(sf,bw){ return SENS125[sf] + 10*Math.log10(bw/125); }
 function noiseFloor(bw){ return -174 + 10*Math.log10(bw*1000) + NOISE_NF; }
 function symbolTime(sf,bw){ return Math.pow(2,sf)/bw; }   // ms (bw in kHz)
 
@@ -272,7 +283,7 @@ function congestionCoef(nOnline,sf,bw){
 // 2. World state
 //==================================================================================
 const ROLES = {                       // rebroadcast policy per role (FloodingRouter)
-  SENSOR :{reb:true ,cancel:true ,router:false, color:'--sensor', label:'Sensor'},
+  SENSOR :{reb:true ,cancel:true ,router:false, color:'--sensor', label:'SLM'}, // SLM node: relays like CLIENT + emits fixed-cadence spectrum; Meshtastic role can be CLIENT or SENSOR
   CLIENT :{reb:true ,cancel:true ,router:false, color:'--client', label:'Client'},
   ROUTER :{reb:true ,cancel:false,router:true , color:'--router', label:'Router'},
   ROUTER_LATE:{reb:true,cancel:false,router:false,late:true,color:'--router',label:'Router-late'},
@@ -285,7 +296,8 @@ let cfg = {};          // pulled from inputs each (re)build
 
 function makeNode(x,y,kind){
   return {id:nextNodeId++, x,y, kind,
-    queue:[], sending:null, seen:new Map(), heard:[],
+    slmRole: (kind==='SENSOR') ? 'SENSOR' : null,
+    queue:[], sending:null, seen:new Map(), heard:[], txAir:[],
     attemptScheduled:false,
     tx:0, rxOk:0};
 }
@@ -314,7 +326,7 @@ let M = null;
 function resetStats(){
   M = {origin:0, deliveredGw:0, gwExists:false, coverageSum:0, coverageCnt:0,
        hopsSum:0, hopsCnt:0, latSum:0, latCnt:0,
-       collisions:0, drops:0, txCount:0, canceled:0,
+       collisions:0, drops:0, txCount:0, canceled:0, skipped:0, bySrc:new Map(),
        windowStart:simTime, pktTrack:new Map(), hist:[]};
 }
 
@@ -326,7 +338,22 @@ function nodeUtilPct(n){            // airtime.cpp channelUtilizationPercent (60
   for(const h of n.heard) if(h.t>=cut) sum+=h.toa;
   return Math.min(100, sum/60000*100);
 }
-function pruneHeard(n){ const cut=simTime-60000; if(n.heard.length>200||n.heard.length&&n.heard[0].t<cut){ n.heard=n.heard.filter(h=>h.t>=cut);} }
+function nodeTxUtilPct(n){          // airtime.cpp utilizationTXPercent (TX-only, ~1h window)
+  // Firmware divides by a full hour; we normalize by elapsed (<=1h) so the steady
+  // state emerges within a short run instead of needing 60 min of sim time.
+  const denom = Math.min(3600000, Math.max(simTime, 5000));
+  const cut = simTime - 3600000; let sum=0;
+  for(const h of n.txAir) if(h.t>=cut) sum+=h.toa;
+  return sum/denom*100;
+}
+// SoundLevelModule::dutyAllows() -- the SLM spectrum broadcast self-throttle
+function dutyAllows(n){
+  if(nodeUtilPct(n) >= 25) return false;                  // isTxAllowedChannelUtil(polite 25%)
+  const txu = nodeTxUtilPct(n);
+  if(cfg.duty < 100 && txu >= cfg.duty*0.5) return false; // isTxAllowedAirUtil (polite = half duty)
+  if(txu >= cfg.slmMaxDuty) return false;                 // SLM_MAX_DUTY_PCT fair-share cap
+  return true;
+}
 function seenKey(p){ return p.origin+'/'+p.id; }
 function markSeen(n,p){ n.seen.set(seenKey(p), simTime+SEEN_MS); }
 function wasSeen(n,p){ const e=n.seen.get(seenKey(p)); if(e===undefined)return false; if(e<simTime){n.seen.delete(seenKey(p));return false;} return true; }
@@ -368,11 +395,12 @@ function setTransmitDelay(n){
   n.attemptScheduled=true;
   scheduleAt(simTime+Math.max(1,delay), ()=>txAttempt(n));
 }
-function channelBusy(n){                         // isChannelActive(): CAD senses preamble
+function channelBusy(n){                         // isChannelActive(): CAD needs a full slot to detect preamble
   const sens = cfg.sens;
   for(const t of activeTx){
     if(t.txNode===n) continue;
-    if(t.start<=simTime && simTime<t.end){
+    // A CAD only reports busy once the preamble has been transmitting for at least one slot time.
+    if(t.start + cfg.slot <= simTime && simTime < t.end){
       if(rssiBetween(n,t.txNode,sens)!==null) return true;
     }
   }
@@ -391,14 +419,17 @@ function startSend(n,p){
   n.sending = tx;
   activeTx.push(tx);
   n.tx++; M.txCount++;
+  n.txAir.push({t:simTime,toa});                                  // TX-only tally for duty/util gating
+  if(n.txAir.length>400) n.txAir = n.txAir.filter(h=>h.t>=simTime-3600000);
   // count airtime toward everyone who can hear it (incl. self) -> drives their CW
   addAirtime(n, tx, toa);
   scheduleAt(tx.end, ()=>txEnd(n,tx));
 }
 function addAirtime(txNode, tx, toa){
   for(const r of nodes){
-    if(r===txNode){ r.heard.push({t:simTime,toa}); continue; }
-    if(rssiBetween(r,txNode,cfg.sens)!==null) r.heard.push({t:simTime,toa});
+    if(r!==txNode && rssiBetween(r,txNode,cfg.sens)===null) continue;
+    r.heard.push({t:simTime,toa});
+    if(r.heard.length>400) r.heard = r.heard.filter(h=>h.t>=simTime-60000); // keep 60s window bounded
   }
 }
 function txEnd(n,tx){
@@ -419,12 +450,21 @@ function decodedAt(r,tx){
     if(o.txNode!==r) continue;
     if(o.start<tx.end && tx.start<o.end) return false;
   }
-  // capture: P must be >= captureDb above every overlapping interferer
+  // capture: P must be >= captureDb above every overlapping interferer.
+  // We also apply the FLoRa/meshtasticator preamble-timing rule: a collision only
+  // happens if the overlap extends past (NPREAMBLE-5) symbols of the later packet.
+  const Tpre = (PREAMBLE - 5) * symbolTime(cfg.sf, cfg.bw);
   for(const o of activeTx){
     if(o===tx || o.txNode===tx.txNode || o.txNode===r) continue;
     if(o.start<tx.end && tx.start<o.end){
       const rssiI = rssiBetween(r,o.txNode,sens);
-      if(rssiI!==null && (rssiP - rssiI) < cfg.cap) return false;
+      if(rssiI!==null){
+        const later = tx.start >= o.start ? tx : o;
+        const earlier = tx.start >= o.start ? o : tx;
+        if(later.start + Tpre < earlier.end){
+          if(rssiP - rssiI < cfg.cap) return false;
+        }
+      }
     }
   }
   return true;
@@ -455,6 +495,7 @@ function receive(r,p,tx){
       t.delivered=true; M.deliveredGw++;
       M.latSum += (simTime - t.born); M.latCnt++;
       M.hopsSum += (p.hopStart - p.hopLimit); M.hopsCnt++;
+      const bs = M.bySrc.get(t.src); if(bs) bs.gwDelivered++;      // per-node freshness
     }
   }
   if(wasSeen(r,p)){
@@ -478,11 +519,23 @@ function receive(r,p,tx){
 
 // ---- origination (Default.h cadence + congestion scaling) -------------------------
 function originate(n,type){
+  const isSlm = (type==='telemetry' && n.kind==='SENSOR');
+  // The SLM spectrum broadcast self-throttles exactly like SoundLevelModule::dutyAllows():
+  // if the channel/duty gates say no, it skips this window (data goes stale) and retries soon.
+  if(isSlm && !dutyAllows(n)){
+    M.skipped++;
+    scheduleAt(simTime + SLM_RETRY_MS, ()=>originate(n,type));
+    return;
+  }
   const p = {id:nextPktId++, origin:n.id, type, bytes:trafficBytes(type),
-             hopLimit:cfg.hops, hopStart:cfg.hops, local:true, rx_snr:0,
-             track:(type==='telemetry' && n.kind==='SENSOR')};
+             hopLimit:cfg.hops, hopStart:cfg.hops, local:true, rx_snr:0, track:isSlm};
   markSeen(n,p);                    // FloodingRouter::send adds our own id to history
-  if(p.track){ M.origin++; M.pktTrack.set(seenKey(p),{born:simTime,delivered:false}); M.gwExists=anyGateway(); }
+  if(p.track){
+    M.origin++; M.gwExists=anyGateway();
+    M.pktTrack.set(seenKey(p),{born:simTime,delivered:false,src:n.id});
+    if(!M.bySrc.has(n.id)) M.bySrc.set(n.id,{gwDelivered:0,sent:0});
+    M.bySrc.get(n.id).sent++;
+  }
   enqueue(n,p);
   scheduleAt(simTime + nextInterval(n,type), ()=>originate(n,type));
 }
@@ -494,10 +547,16 @@ function trafficBytes(type){
 function nextInterval(n,type){     // ms, with +-15% jitter
   let s;
   const k=n.kind;
-  if(type==='telemetry') s = (k==='SENSOR')? cfg.iSensor : cfg.iTelem;
+  if(type==='telemetry'){
+    s = (k==='SENSOR')? cfg.iSensor : cfg.iTelem;
+    // SLM nodes can be Meshtastic CLIENT or SENSOR role. CLIENT scales with congestion
+    // (>40 nodes); SENSOR keeps priority (Default.cpp).
+    if(cfg.congest && k==='SENSOR' && n.slmRole==='CLIENT')
+      s *= congestionCoef(nodes.length, cfg.sf, cfg.bw);
+  }
   else if(type==='position') s = cfg.iPos;
   else s = cfg.iInfo;
-  // congestion scaling: clients scale up; sensors/routers keep priority
+  // congestion scaling for normal CLIENT traffic (not SENSOR/ROUTER)
   if(cfg.congest && !ROLES[k].router && k!=='SENSOR' && (type==='telemetry'||type==='position'))
     s *= congestionCoef(nodes.length, cfg.sf, cfg.bw);
   const jitter = 0.85 + 0.3*rand();
@@ -512,13 +571,13 @@ function readCfg(){
   const pr = PRESETS[$('preset').value];
   cfg = {
     sf:pr.sf, bw:pr.bw, cr:pr.cr,
-    sens:sensitivity(pr.sf,pr.bw), noise:noiseFloor(pr.bw), slot:slotTimeMs(pr.sf,pr.bw),
+    sens:pr.sens, noise:noiseFloor(pr.bw), slot:slotTimeMs(pr.sf,pr.bw),
     hops:+$('hops').value,
     range:+$('range').value, pln:+$('pln').value/10, sigma:+$('sig').value/10, cap:+$('cap').value/10,
     iSensor:+$('iSensor').value, iTelem:+$('iTelem').value, iPos:+$('iPos').value, iInfo:+$('iInfo').value,
     payS:+$('payS').value, congest:$('congest').checked,
     speed:+$('spd').value, win:+$('win').value*1000, seed:+$('seed').value,
-    duty:+$('region').value,
+    duty:+$('region').value, slmMaxDuty:5.0, // SLM_MAX_DUTY_PCT (your platformio build)
   };
   $('presetline').textContent = `${$('preset').value} · ${cfg.bw}kHz SF${cfg.sf} · ToA≈${Math.round(toaMs(cfg.payS+HEADER_LEN,cfg.sf,cfg.bw,cfg.cr))}ms · slot ${Math.round(cfg.slot)}ms · sens ${cfg.sens.toFixed(0)}dBm`;
 }
@@ -526,7 +585,7 @@ function rebuildSchedule(){
   // Re-seed and re-arm all originators + clear in-flight state, keep node positions.
   RNG = mulberry32(cfg.seed>>>0);
   ev.clear(); activeTx.length=0; flashes.length=0; simTime=0; nextPktId=1;
-  for(const n of nodes){ n.queue.length=0; n.sending=null; n.seen.clear(); n.heard.length=0; n.attemptScheduled=false; n.tx=0; n.rxOk=0; }
+  for(const n of nodes){ n.queue.length=0; n.sending=null; n.seen.clear(); n.heard.length=0; n.txAir.length=0; n.attemptScheduled=false; n.tx=0; n.rxOk=0; }
   resetStats();
   for(const n of nodes){
     // stagger initial originations across each interval (random phase)
@@ -577,10 +636,31 @@ function utilColor(u){ // green -> amber -> red
   if(t<0.5){ const k=t/0.5; return `rgb(${Math.round(90+120*k)},${Math.round(209-40*k)},${Math.round(127-30*k)})`; }
   const k=(t-0.5)/0.5; return `rgb(${Math.round(210+45*k)},${Math.round(169-90*k)},${Math.round(97-30*k)})`;
 }
+function drawGrid(){
+  const W=stageRect.width,H=stageRect.height;
+  const step=100, labelEvery=200;
+  ctx.save();
+  ctx.strokeStyle='rgba(120,140,180,0.07)'; ctx.lineWidth=1;
+  ctx.fillStyle=css('--dim'); ctx.font='10px ui-monospace';
+  // vertical lines + x-axis labels at bottom
+  ctx.textAlign='center'; ctx.textBaseline='bottom';
+  for(let x=0;x<=W;x+=step){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for(let x=0;x<=W;x+=labelEvery){ ctx.fillText(x+'px',x,H-4); }
+  // horizontal lines + y-axis labels at left
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  for(let y=0;y<=H;y+=step){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  for(let y=0;y<=H;y+=labelEvery){ ctx.fillText(y+'px',4,y); }
+  // scale bar / range legend
+  ctx.textAlign='right'; ctx.textBaseline='bottom';
+  ctx.fillText(`range ${cfg.range}px`, W-10, H-10);
+  ctx.restore();
+}
+
 function draw(){
   if(!stageRect) return;
   const W=stageRect.width,H=stageRect.height;
   ctx.clearRect(0,0,W,H);
+  drawGrid();
   // links between in-range neighbours (faint)
   ctx.strokeStyle='rgba(120,140,180,0.07)'; ctx.lineWidth=1;
   ctx.beginPath();
@@ -661,6 +741,14 @@ function updateMetrics(){
   $('m-pdr').innerHTML = pdr==null? (gws?'&mdash; <small>%</small>':'<small style="color:var(--dim)">no gateway</small>')
                                  : pdr.toFixed(0)+' <small>%</small>';
   $('m-pdr').style.color = pdr==null?'':(pdr>80?css('--good'):pdr>50?css('--warn'):css('--bad'));
+  // SLM data freshness: mean gateway update interval per SLM node (captures BOTH throttle skips and collisions)
+  const elapsedS=Math.max(1,(simTime-M.windowStart)/1000);
+  let totDeliv=0; for(const b of M.bySrc.values()) totDeliv+=b.gwDelivered;
+  const fresh = (totDeliv>0 && sensors>0 && gws>0)? (sensors*elapsedS/totDeliv) : Infinity;
+  $('m-fresh').innerHTML = !gws? '<small style="color:var(--dim)">no gateway</small>'
+                         : !isFinite(fresh)? '&infin; <small>none reached</small>'
+                         : fresh.toFixed(0)+' <small>s</small>';
+  $('m-fresh').style.color = (!gws)?'':(!isFinite(fresh)?css('--bad'):(fresh<30?css('--good'):fresh<90?css('--warn'):css('--bad')));
   const cov = M.coverageCnt? 100*M.coverageSum/M.coverageCnt:null;
   $('m-cov').innerHTML = cov==null?'&mdash; <small>%</small>':cov.toFixed(0)+' <small>%</small>';
   const elapsedMin = Math.max(1/60,(simTime-M.windowStart)/60000);
@@ -672,6 +760,7 @@ function updateMetrics(){
   $('m-drop').innerHTML=(M.drops/secs).toFixed(1)+' <small>/s</small>';
   $('m-hops').textContent = M.hopsCnt? (M.hopsSum/M.hopsCnt).toFixed(1):'—';
   $('m-lat').innerHTML = M.latCnt? Math.round(M.latSum/M.latCnt)+' <small>ms</small>':'&mdash; <small>ms</small>';
+  $('m-skip').innerHTML = (M.skipped/elapsedMin).toFixed(0)+' <small>/min</small>';
   $('hud').textContent=`sim ${(simTime/1000).toFixed(1)}s · ${nodes.length} nodes · ${running?'running '+cfg.speed+'×':'paused'}`;
 }
 
@@ -726,9 +815,21 @@ function refreshSelPanel(){
     $('brushes').parentNode.insertBefore(host,$('brushes').nextSibling.nextSibling); }
   if(!selected){ host.innerHTML=''; return; }
   host.innerHTML=`<div class="note">Selected #${selected.id} —
-    <select id="selRole"></select> <button id="selDel" class="warn">del</button></div>`;
+    <select id="selRole"></select> <button id="selDel" class="warn">del</button></div>
+    <div class="note" id="slmRoleRow" style="display:none;margin-top:6px">SLM Meshtastic role
+    <select id="selSlmRole"><option value="CLIENT">CLIENT</option><option value="SENSOR">SENSOR</option></select>
+    <small style="color:var(--dim)">(CLIENT scales interval when >40 nodes)</small></div>`;
   const sel=$('selRole'); for(const k in ROLES){ const o=document.createElement('option'); o.value=k; o.textContent=ROLES[k].label; if(k===selected.kind)o.selected=true; sel.appendChild(o); }
-  sel.onchange=()=>{ selected.kind=sel.value; draw(); updateMetrics(); };
+  sel.onchange=()=>{
+    selected.kind=sel.value;
+    if(selected.kind==='SENSOR' && !selected.slmRole) selected.slmRole='SENSOR';
+    refreshSelPanel(); draw(); updateMetrics();
+  };
+  if(selected.kind==='SENSOR'){
+    $('slmRoleRow').style.display='block';
+    $('selSlmRole').value=selected.slmRole||'SENSOR';
+    $('selSlmRole').onchange=()=>{ selected.slmRole=$('selSlmRole').value; draw(); updateMetrics(); };
+  }
   $('selDel').onclick=()=>removeNode(selected);
 }
 
