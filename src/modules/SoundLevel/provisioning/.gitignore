@@ -2,3 +2,4 @@
 # values — keep them local. The README documents how to recreate them.
 gateway.yaml
 slm-node.yaml
+foh-node.yaml

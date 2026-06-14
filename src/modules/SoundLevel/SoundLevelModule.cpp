@@ -24,7 +24,7 @@
 #include "gps/RTC.h"    // getTime() for a wall-clock stamp when RTC is valid
 #endif
 
-#if HAS_SCREEN
+#ifdef SLM_HAS_DISPLAY
 #include "graphics/Screen.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/SharedUIDisplay.h"
@@ -125,6 +125,15 @@
 #define SLM_CAPTURE_STATS 1
 #endif
 
+// Glitch-robust capture (the I2S overflow callback + drop-the-glitched-interval guard +
+// deeper DMA ring) is on by default. Define -DSLM_NO_GLITCH_GUARD to revert to the
+// baseline capture path (always emit every interval, IDF-default DMA ring) — e.g. to
+// A/B test whether the guard is implicated in a slowdown. The overflow counter/callback
+// is still compiled when the diagnostics that print it (DIAG / FS log) are enabled.
+#if !defined(SLM_NO_GLITCH_GUARD) || defined(SLM_AUDIO_DIAG) || defined(SLM_FS_LOG)
+#define SLM_TRACK_OVERFLOW 1
+#endif
+
 // Front-of-house live streaming (opt-in). When defined, the module also emits the
 // most-recent base interval's spectrum to any locally connected client (BLE / USB
 // serial / TCP) via MeshService::sendToPhone() — no LoRa transmission, no airtime
@@ -173,12 +182,14 @@ uint32_t s_accBlocks;
 // task compares it across each base interval and discards any interval during which a
 // buffer was dropped, so the resulting discontinuity can't ring the filter bank and
 // spike the reading. (Also surfaced by the SLM_AUDIO_DIAG log line.)
+#ifdef SLM_TRACK_OVERFLOW
 volatile uint32_t g_ovf = 0;
 bool IRAM_ATTR onI2sOvf(i2s_chan_handle_t, i2s_event_data_t *, void *)
 {
     g_ovf++;
     return false;   // no higher-priority task to wake
 }
+#endif
 
 #ifdef SLM_AUDIO_DIAG
 // Producer heartbeat, so the consumer's DIAG line can print the real capture rate (hz).
@@ -208,7 +219,9 @@ bool readBlock()
 
 void audioTask(void *)
 {
+#ifndef SLM_NO_GLITCH_GUARD
     uint32_t intervalStartOvf = g_ovf;   // overflow count at the start of the current interval
+#endif
     for (;;) {
         if (!readBlock()) {
             vTaskDelay(1);
@@ -231,6 +244,7 @@ void audioTask(void *)
 #endif
         s_bank.process(s_block);
         if (s_bank.blocks() >= kBaseIntervalBlocks) {
+#ifndef SLM_NO_GLITCH_GUARD
             if (g_ovf != intervalStartOvf) {
                 // A DMA buffer was dropped during this interval: the discontinuity has
                 // rung the filter bank. Discard the interval and clear the filter state
@@ -242,7 +256,9 @@ void audioTask(void *)
                 s_rawN = 0;
                 s_rawPeak = 0;
 #endif
-            } else {
+            } else
+#endif // !SLM_NO_GLITCH_GUARD
+            {
                 BaseSnap m;
                 s_bank.takeInterval(m.snap, &m.blocks);   // copy out by value, reset bank
 #ifdef SLM_CAPTURE_STATS
@@ -262,7 +278,9 @@ void audioTask(void *)
                     xQueueSend(s_snapQ, &m, 0);
                 }
             }
+#ifndef SLM_NO_GLITCH_GUARD
             intervalStartOvf = g_ovf;
+#endif
         }
     }
 }
@@ -345,8 +363,10 @@ SoundLevelModule::SoundLevelModule()
 bool SoundLevelModule::startCapture()
 {
     i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+#ifndef SLM_NO_GLITCH_GUARD
     chanCfg.dma_desc_num = SLM_DMA_DESC_NUM;     // deeper ring => more starvation headroom
     chanCfg.dma_frame_num = SLM_DMA_FRAME_NUM;
+#endif
     if (i2s_new_channel(&chanCfg, nullptr, &s_rxChan) != ESP_OK) {
         LOG_ERROR("SoundLevel: i2s_new_channel failed");
         return false;
@@ -368,6 +388,7 @@ bool SoundLevelModule::startCapture()
         teardownCapture(false);
         return false;
     }
+#ifdef SLM_TRACK_OVERFLOW
     // Register the DMA-overflow callback so the audio task can drop glitched intervals
     // (and the DIAG build can log overflows). Must be registered while the channel is in
     // READY (not RUNNING), i.e. before enable.
@@ -377,6 +398,7 @@ bool SoundLevelModule::startCapture()
         if (i2s_channel_register_event_callback(s_rxChan, &cbs, nullptr) != ESP_OK)
             LOG_WARN("SoundLevel: overflow callback registration failed");
     }
+#endif
     if (i2s_channel_enable(s_rxChan) != ESP_OK) {
         LOG_ERROR("SoundLevel: I2S PDM init failed (clk=%d data=%d)", SLM_PDM_CLK_PIN, SLM_PDM_DATA_PIN);
         teardownCapture(false);
@@ -399,7 +421,7 @@ bool SoundLevelModule::startCapture()
     }
     LOG_INFO("SoundLevel: capturing @%.0f Hz, base %lu ms, Tmin %ds, self-duty %.2f%%", (double)OCT_FS0,
              (unsigned long)SLM_BASE_INTERVAL_MS, (int)SLM_TMIN_S, (double)SLM_MAX_DUTY_PCT);
-#if HAS_SCREEN
+#ifdef SLM_HAS_DISPLAY
     // Mic is live: advertise the meter frame and ask the screen to rebuild its frameset.
     captureOk = true;
     UIFrameEvent e;
@@ -520,7 +542,7 @@ bool SoundLevelModule::drainBaseIntervals()
         lastFsOvf = g_ovf;
     }
 #endif
-#if HAS_SCREEN || defined(SLM_FOH_STREAM)
+#if defined(SLM_HAS_DISPLAY) || defined(SLM_FOH_STREAM)
     // Keep the most recent base interval for the live on-device meter and/or the FoH
     // stream (the long TX window keeps growing in s_accE, but these want a fresh, short
     // reading).
@@ -625,7 +647,7 @@ int32_t SoundLevelModule::runOnce()
     return SLM_BASE_INTERVAL_MS;
 }
 
-#if HAS_SCREEN
+#ifdef SLM_HAS_DISPLAY
 // ---------------------------------------------------------------------------
 // On-device UI: a live dBA bar meter plus the 31-band 1/3-octave spectrum,
 // computed from the most recent ~1 s base interval (dispE/dispBlocks). Runs on
@@ -755,6 +777,6 @@ void SoundLevelModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state
     }
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 }
-#endif // HAS_SCREEN
+#endif // SLM_HAS_DISPLAY
 
 #endif // ARCH_ESP32 && SLM_ENABLED

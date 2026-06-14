@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/gravye/Documents/PlatformIO/Projects/meshtastic-firmware-slm/.venv/bin/python -m ensurepip --upgrade)",
+      "Bash(/Users/gravye/Documents/PlatformIO/Projects/meshtastic-firmware-slm/.venv/bin/python -u /tmp/slm_mqtt_decode.py 60)",
+      "Bash(echo \"decoder PID $! \\(proxy host\\)\")",
+      "Bash(mosquitto_sub -h 127.0.0.1 -u slm -P slmdebug123 -t 'TA/SLM/decoded/#' -W 40)",
+      "Read(//Users/gravye/**)",
+      "Read(//Users/gravye/Documents/**)",
+      "Bash(.venv/bin/python -c \"import paho.mqtt; print\\('paho OK', paho.mqtt.__version__\\)\")",
+      "Bash(.venv/bin/python tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemE072A1D84E101 --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123)"
+    ]
+  }
+}

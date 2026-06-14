@@ -27,7 +27,9 @@ elapsed window (in seconds) so the receiving side can compute correct Leq.
 
 On builds with a display (`HAS_SCREEN`), the module adds a UI frame to the
 normal screen carousel showing a live meter, refreshed every base interval
-(~1 s) from the most recent interval (independent of the LoRa transmit window):
+(~1 s) from the most recent interval (independent of the LoRa transmit window).
+(Compile it out on a screen-equipped board with `-DSLM_NO_DISPLAY` — see
+[Build-time configuration](#build-time-configuration).) The meter shows:
 
 - the broadband **dBA** level (top-left), a **countdown to the next broadcast**
   (top-center) and the loudest 1/3-octave band's center frequency (top-right), and
@@ -98,12 +100,15 @@ All of these are overridable via `build_flags` in the variant's
 | `SLM_FS_LOG_MAX_BYTES` | 65536 | Rotate to `<path>.1` past this size (total on-flash ≤ 2×). |
 | `SLM_FS_LOG_CREST_DB` / `SLM_FS_LOG_LAEQ_DB` | 25 / 200 | Excursion thresholds: an interval with crest above the first (impulsive corruption) or `LAeq` above the second (default ~off) is flagged. |
 | `SLM_FS_LOG_SUSTAIN_S` | 30 | Min seconds between repeated lines during one sustained excursion / drop storm, so a long event costs a few lines, not one per second. |
+| `SLM_NO_DISPLAY` | (unset) | **Disable switch.** Compile out the on-device OLED meter even on a `HAS_SCREEN` board — no `drawFrame`, no UI frame in the carousel, no per-interval display copy. Lets you A/B whether the on-device draw is implicated in a slowdown. |
+| `SLM_NO_GLITCH_GUARD` | (unset) | **Disable switch.** Revert the capture path to the pre-`1cb7443d` baseline: no I2S-overflow callback, no drop-the-glitched-interval logic, and the IDF-default DMA ring (ignores `SLM_DMA_*`). Every interval is emitted as captured. |
 
-**Glitch robustness:** the audio task watches the DMA overflow counter and, for any base
-interval during which a buffer was dropped, discards that interval and resets the filter
-bank — so a capture discontinuity makes the meter skip a beat rather than spike (a dropped
-buffer otherwise rings the high-Q low-frequency 1/3-octave bands for seconds). This runs
-unconditionally, independent of `SLM_AUDIO_DIAG`.
+**Glitch robustness:** by default the audio task watches the DMA overflow counter and, for
+any base interval during which a buffer was dropped, discards that interval and resets the
+filter bank — so a capture discontinuity makes the meter skip a beat rather than spike (a
+dropped buffer otherwise rings the high-Q low-frequency 1/3-octave bands for seconds). This
+runs independent of `SLM_AUDIO_DIAG`, and can be turned off with `-DSLM_NO_GLITCH_GUARD`
+(see the table) to compare against the baseline capture path.
 
 ## Retrieving logs from a deployed node
 

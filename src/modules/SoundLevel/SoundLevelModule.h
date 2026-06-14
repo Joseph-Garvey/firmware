@@ -2,7 +2,16 @@
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 #include "octave_bank.h"
-#if HAS_SCREEN
+
+// On-device OLED sound-level meter. Compiled in whenever the board firmware has a screen
+// (HAS_SCREEN), unless explicitly disabled with -DSLM_NO_DISPLAY — e.g. to measure whether
+// the on-device draw is implicated in a slowdown vs. the headless sensor build. Gate all
+// meter code on SLM_HAS_DISPLAY (not HAS_SCREEN directly) so the one flag turns it all off.
+#if HAS_SCREEN && !defined(SLM_NO_DISPLAY)
+#define SLM_HAS_DISPLAY 1
+#endif
+
+#ifdef SLM_HAS_DISPLAY
 #include <OLEDDisplay.h>
 #include <OLEDDisplayUi.h>
 #endif
@@ -27,7 +36,7 @@
  * duty-cycle math.
  */
 class SoundLevelModule : public SinglePortModule,
-#if HAS_SCREEN
+#ifdef SLM_HAS_DISPLAY
                          public Observable<const UIFrameEvent *>,
 #endif
                          private concurrency::OSThread
@@ -38,7 +47,7 @@ class SoundLevelModule : public SinglePortModule,
   protected:
     virtual int32_t runOnce() override;
 
-#if HAS_SCREEN
+#ifdef SLM_HAS_DISPLAY
     // Live on-device sound-level meter: a dBA bar plus the 1/3-octave spectrum.
     virtual bool wantUIFrame() override { return captureOk; }
     virtual Observable<const UIFrameEvent *> *getUIFrameObservable() override { return this; }
@@ -69,7 +78,7 @@ class SoundLevelModule : public SinglePortModule,
     uint32_t fsDropWriteMs = 0;   // throttle for repeated drop events
 #endif
 
-#if HAS_SCREEN || defined(SLM_FOH_STREAM)
+#if defined(SLM_HAS_DISPLAY) || defined(SLM_FOH_STREAM)
     // Most-recent base interval, kept for the live on-device meter and/or the FoH
     // high-rate stream. Owned by the consumer thread (runOnce/drawFrame both run on
     // the main loop, no locks).
