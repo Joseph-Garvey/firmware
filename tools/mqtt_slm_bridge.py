@@ -30,19 +30,13 @@ Examples:
   python mqtt_slm_bridge.py --broker 10.250.0.155 --broker-user slm --broker-pass slmdebug123 \
       --in-root TA/SLM --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 """
-import argparse, json, os, struct, sys, time
+import argparse, json, os, sys, time
 
 from meshtastic.protobuf import mqtt_pb2, portnums_pb2
 
+from slm_frame import CENTERS, fmt_hz, parse_v2   # shared v2 decode (also used by foh bridge)
+
 PRIVATE_APP = portnums_pb2.PortNum.PRIVATE_APP  # 256
-# IEC base-10 1/3-octave centers, 31 bands. Index 17 == 1 kHz. Must match OctaveBank.
-CENTERS = [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
-           800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000,
-           12500, 16000, 20000]
-
-
-def fmt_hz(hz):
-    return f"{hz/1000:g}k" if hz >= 1000 else f"{hz:g}"
 
 
 def decode_envelope(data, args, out):
@@ -88,19 +82,17 @@ def decode_envelope(data, args, out):
 
     label = args.label_map.get(node)
     tag = f"{node} ({label})" if label else node
-    if len(p) != 35 or p[0] != 0x02:
+    frame = parse_v2(bytes(p))   # shared decode -> {window_s, bands_hz, levels_db, peak_db, peak_hz}
+    if frame is None:
         print(f"  !! {tag}: not a v2 35-byte SLM frame (len={len(p)} ver={p[0] if p else '?'})")
         return
-    nbands = p[1]
-    window = struct.unpack_from("<H", p, 2)[0]
-    levels = [p[4 + b] / 2.0 for b in range(nbands)]  # 0.5 dB/LSB
-    peak = max(levels)
-    peak_hz = CENTERS[levels.index(peak)]
 
     if not args.quiet:
-        print(f"\n=== {tag}  ch={env.channel_id}  window={window}s  "
-              f"1kHz={levels[17]:.1f}dB  peak={peak:.1f}dB @ {fmt_hz(peak_hz)}Hz ===")
-        for b in range(nbands):
+        levels = frame["levels_db"]
+        print(f"\n=== {tag}  ch={env.channel_id}  window={frame['window_s']}s  "
+              f"1kHz={levels[17]:.1f}dB  peak={frame['peak_db']:.1f}dB "
+              f"@ {fmt_hz(frame['peak_hz'])}Hz ===")
+        for b in range(len(levels)):
             print(f"   {fmt_hz(CENTERS[b]):>6}Hz {levels[b]:5.1f} |{'#' * int(levels[b] / 2)}")
 
     if out is not None:
@@ -108,8 +100,7 @@ def decode_envelope(data, args, out):
         # frame immediately instead of waiting ~15s for the next uplink.
         out.publish(f"{args.out_root}/decoded/{node}",
                     json.dumps({"node": node, "label": label, "channel": env.channel_id,
-                                "window_s": window, "bands_hz": CENTERS,
-                                "levels_db": levels, "peak_db": peak, "peak_hz": peak_hz}),
+                                **frame}),
                     retain=args.retain)
     decode_envelope.count = getattr(decode_envelope, "count", 0) + 1
 
