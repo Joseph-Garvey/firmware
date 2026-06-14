@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meshtastic flood simulator</title>
+<!--
+  Meshtastic mesh saturation simulator (self-contained, no build, no network).
+
+  Goal: place nodes and watch where the mesh bogs down and collapses, using the
+  *same* radio/MAC logic the firmware uses:
+
+    - LoRa time-on-air         Semtech ToA formula w/ the real preset SF/BW/CR
+                               (RadioInterface::getPacketTime -> RadioLib getTimeOnAir)
+    - slot time                computeSlotTimeMsec(): 2.5*Tsym + 7.6 ms
+    - contention window        CWsize = map(channelUtil,0..100,3..8)            (getTxDelayMsec)
+    - SNR-weighted rebroadcast 2*CWmax*slot + rand(0,2^CW)*slot, CW from rx_snr  (getTxDelayMsecWeighted)
+    - channel utilization      rolling 60s (6x10s) sum of all heard airtime      (airtime.cpp)
+    - CAD / listen-before-talk defer if channel sensed busy                      (onNotify/isChannelActive)
+    - flooding                 dedup (seen-recently), hop-limit decrement,
+                               CLIENT cancels rebroadcast on dupe, ROUTER never  (FloodingRouter.cpp)
+    - origination cadence      position/telemetry/nodeinfo defaults + the >40
+                               node congestion-scaling coefficient              (Default.h/.cpp)
+
+  Collision/capture and path-loss are physics the firmware does NOT model; we use
+  the standard log-distance + co-SF capture model used by LoRaSim/FLoRa.
+
+  Just open the file in a browser (file:// is fine -- no external deps).
+-->
+<style>
+  :root{
+    --bg:#0c0e14; --panel:#141821; --panel2:#1b2130; --ink:#e7ecf3; --dim:#7b8698;
+    --grid:#222838; --accent:#46e0c0; --warn:#ffb454; --bad:#ff5d6c; --good:#5ad17f;
+    --sensor:#46e0c0; --client:#6ea8ff; --router:#c08bff; --gw:#ffd166; --mute:#5b6678;
+    --font: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);
+       -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;overflow:hidden;}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:9px 16px;
+         border-bottom:1px solid var(--grid);background:var(--panel);}
+  header h1{font-size:14px;margin:0;letter-spacing:.4px;font-weight:600;}
+  header .sub{color:var(--dim);font-size:12px;}
+  header .spacer{margin-left:auto;}
+  button{font-family:var(--font);font-size:12px;color:var(--ink);background:var(--panel2);
+         border:1px solid var(--grid);border-radius:6px;padding:6px 10px;cursor:pointer;}
+  button:hover{border-color:var(--accent);}
+  button.primary{background:var(--accent);color:#05221c;border-color:var(--accent);font-weight:600;}
+  button.warn{border-color:var(--warn);}
+  button.sel{outline:2px solid var(--accent);outline-offset:-2px;}
+  main{flex:1;display:grid;grid-template-columns:248px 1fr 300px;min-height:0;}
+  .col{overflow-y:auto;padding:12px;}
+  .col.left{border-right:1px solid var(--grid);background:var(--panel);}
+  .col.right{border-left:1px solid var(--grid);background:var(--panel);}
+  .stage{position:relative;min-width:0;background:
+     radial-gradient(circle at 50% 40%, #11151f 0%, #0a0c11 100%);}
+  canvas#net{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
+  .hud{position:absolute;left:10px;bottom:10px;font-size:11px;color:var(--dim);
+       background:rgba(12,14,20,.7);padding:6px 9px;border:1px solid var(--grid);border-radius:6px;pointer-events:none;}
+  h2{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);
+     margin:16px 0 8px;font-weight:600;}
+  h2:first-child{margin-top:0;}
+  label.row{display:flex;align-items:center;justify-content:space-between;gap:8px;
+            font-size:12px;margin:6px 0;color:var(--ink);}
+  label.row .v{color:var(--accent);min-width:54px;text-align:right;}
+  input[type=range]{width:120px;accent-color:var(--accent);}
+  select,input[type=number]{font-family:var(--font);font-size:12px;background:var(--panel2);
+     color:var(--ink);border:1px solid var(--grid);border-radius:5px;padding:4px 6px;}
+  input[type=number]{width:72px;}
+  .brushes{display:flex;flex-wrap:wrap;gap:6px;}
+  .brush{display:flex;align-items:center;gap:5px;font-size:11px;padding:5px 7px;border:1px solid var(--grid);
+         border-radius:6px;cursor:pointer;background:var(--panel2);}
+  .brush .sw{width:10px;height:10px;border-radius:50%;}
+  .brush.sel{border-color:var(--accent);}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+  .stat{background:var(--panel2);border:1px solid var(--grid);border-radius:7px;padding:8px 9px;}
+  .stat .k{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;}
+  .stat .v{font-size:18px;font-weight:600;margin-top:2px;}
+  .stat .v small{font-size:11px;color:var(--dim);font-weight:400;}
+  .stat.wide{grid-column:1/3;}
+  canvas.chart{width:100%;height:96px;display:block;background:var(--panel2);
+               border:1px solid var(--grid);border-radius:7px;margin-top:6px;}
+  .note{font-size:11px;color:var(--dim);line-height:1.45;}
+  .legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--dim);margin-top:6px;}
+  .legend span{display:inline-flex;align-items:center;gap:5px;}
+  .legend .sw{width:9px;height:9px;border-radius:50%;}
+  hr{border:none;border-top:1px solid var(--grid);margin:14px 0;}
+  .pill{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;border:1px solid var(--grid);color:var(--dim);}
+  details{margin-top:8px;} summary{cursor:pointer;font-size:11px;color:var(--dim);}
+</style>
+</head>
+<body>
+<header>
+  <h1>MESH FLOOD SIM</h1>
+  <span class="sub" id="presetline">LongFast &middot; 250kHz SF11</span>
+  <span class="spacer"></span>
+  <button id="btnPlay" class="primary">&#9654; Run</button>
+  <button id="btnStep">Step 1s</button>
+  <button id="btnReset">Reset stats</button>
+  <button id="btnClear" class="warn">Clear nodes</button>
+</header>
+
+<main>
+  <!-- ------------------------------ LEFT: controls ------------------------------ -->
+  <section class="col left">
+    <h2>Place nodes</h2>
+    <div class="brushes" id="brushes"></div>
+    <div class="note" style="margin-top:8px">
+      Click empty space to drop a node &middot; drag to move &middot; shift-click to delete.
+    </div>
+    <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+      <button id="btnFill">Fill +<span id="fillN">25</span></button>
+      <button id="btnGrid">Grid</button>
+      <button id="btnRing">Ring</button>
+    </div>
+
+    <h2>Radio preset</h2>
+    <select id="preset"></select>
+    <label class="row">Region duty cycle
+      <select id="region">
+        <option value="100">none (US)</option>
+        <option value="10">10% (EU router)</option>
+        <option value="2.5" selected>2.5% (EU client)</option>
+        <option value="1">1%</option>
+      </select>
+    </label>
+    <label class="row">Hop limit <input type="number" id="hops" min="1" max="7" value="3"></label>
+
+    <h2>Link / propagation</h2>
+    <label class="row">Range (px) <span class="v" id="rangeV">160</span><input type="range" id="range" min="40" max="400" value="160"></label>
+    <label class="row">Path-loss n <span class="v" id="plnV">2.7</span><input type="range" id="pln" min="20" max="45" value="27"></label>
+    <label class="row">Shadowing &sigma; <span class="v" id="sigV">0 dB</span><input type="range" id="sig" min="0" max="80" value="0"></label>
+    <label class="row">Capture &Delta; <span class="v" id="capV">6 dB</span><input type="range" id="cap" min="0" max="120" value="60"></label>
+
+    <h2>Traffic (TX intervals)</h2>
+    <label class="row">Sensor telem <input type="number" id="iSensor" min="2" max="3600" value="15"> s</label>
+    <label class="row">Client telem <input type="number" id="iTelem" min="10" max="86400" value="3600"> s</label>
+    <label class="row">Position <input type="number" id="iPos" min="10" max="86400" value="3600"> s</label>
+    <label class="row">NodeInfo <input type="number" id="iInfo" min="3600" max="172800" value="10800"> s</label>
+    <label class="row">Sensor payload <input type="number" id="payS" min="8" max="230" value="50"> B</label>
+    <label class="row"><span title="firmware scales client position/telemetry intervals up when >40 nodes are online">Congestion scaling</span>
+      <input type="checkbox" id="congest" checked></label>
+
+    <h2>Run</h2>
+    <label class="row">Speed <span class="v" id="spdV">60&times;</span><input type="range" id="spd" min="1" max="300" value="60"></label>
+    <label class="row">Measure window <input type="number" id="win" min="10" max="600" value="120"> s</label>
+    <label class="row">Seed <input type="number" id="seed" min="0" max="999999" value="1"></label>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <!-- ------------------------------ CENTER: canvas ------------------------------ -->
+  <section class="stage">
+    <canvas id="net"></canvas>
+    <div class="hud" id="hud">sim 0.0s</div>
+  </section>
+
+  <!-- ------------------------------ RIGHT: metrics ------------------------------ -->
+  <section class="col right">
+    <h2>Network</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">Nodes</div><div class="v" id="m-nodes">0</div></div>
+      <div class="stat"><div class="k">Sensors / GW</div><div class="v" id="m-sg">0/0</div></div>
+      <div class="stat wide"><div class="k">Gateway delivery (PDR)</div><div class="v" id="m-pdr">&mdash; <small>%</small></div></div>
+      <div class="stat"><div class="k">Coverage</div><div class="v" id="m-cov">&mdash; <small>%</small></div></div>
+      <div class="stat"><div class="k">Offered</div><div class="v" id="m-off">0 <small>/min</small></div></div>
+      <div class="stat"><div class="k">Ch. util mean</div><div class="v" id="m-util">0 <small>%</small></div></div>
+      <div class="stat"><div class="k">Ch. util max</div><div class="v" id="m-utilmax">0 <small>%</small></div></div>
+      <div class="stat"><div class="k">Collisions</div><div class="v" id="m-coll">0 <small>/s</small></div></div>
+      <div class="stat"><div class="k">Queue drops</div><div class="v" id="m-drop">0 <small>/s</small></div></div>
+      <div class="stat"><div class="k">Mean hops</div><div class="v" id="m-hops">&mdash;</div></div>
+      <div class="stat"><div class="k">Latency</div><div class="v" id="m-lat">&mdash; <small>ms</small></div></div>
+    </div>
+    <canvas class="chart" id="chart"></canvas>
+    <div class="note" id="chartlbl">PDR (green) &amp; mean ch.util (amber) over time</div>
+
+    <h2>Densify sweep</h2>
+    <div class="note">Add nodes in steps, measure each, and plot the collapse knee.</div>
+    <label class="row">Add / step <input type="number" id="swStep" min="1" max="100" value="10"></label>
+    <label class="row">Max nodes <input type="number" id="swMax" min="10" max="600" value="200"></label>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button id="btnSweep" class="primary">Run sweep</button>
+      <button id="btnSweepStop">Stop</button>
+    </div>
+    <canvas class="chart" id="sweep" style="height:120px"></canvas>
+    <div class="note" id="sweeplbl">PDR (green) &amp; util (amber) vs node count</div>
+
+    <details>
+      <summary>What's modelled &amp; what isn't</summary>
+      <div class="note" style="margin-top:6px">
+        Faithful to firmware: ToA per preset, slot time, util-driven CW backoff,
+        SNR-weighted rebroadcast delay &amp; router offset, CAD defer, flood dedup +
+        hop decrement, CLIENT dupe-cancel vs ROUTER, &gt;40-node congestion scaling,
+        TX queue cap (16) drops.<br><br>
+        Physics added (not in firmware): log-distance path loss
+        RSSI(d)=sens+10&middot;n&middot;log10(range/d), co-SF capture (&Delta; dB),
+        optional shadowing.<br><br>
+        Not modelled: DM unicast / NextHop routing, want_ack retransmits, MQTT
+        uplink latency, mobility, inter-SF non-orthogonality.
+      </div>
+    </details>
+  </section>
+</main>
+
+<script>
+"use strict";
+//==================================================================================
+// 0. Small utilities
+//==================================================================================
+const $ = id => document.getElementById(id);
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let RNG = mulberry32(1);
+const rand = () => RNG();
+const randInt = n => Math.floor(RNG()*n);          // Arduino random(0,n) -> [0,n)
+// Arduino integer map() (no clamp), then we clamp to the output band for safety.
+function amap(x,inMin,inMax,outMin,outMax){
+  let v = Math.floor((x-inMin)*(outMax-outMin)/(inMax-inMin))+outMin;
+  const lo=Math.min(outMin,outMax), hi=Math.max(outMin,outMax);
+  return Math.max(lo,Math.min(hi,v));
+}
+function gaussian(){ // Box-Muller, for shadowing
+  let u=0,v=0; while(!u)u=rand(); while(!v)v=rand();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+
+//==================================================================================
+// 1. Radio constants & LoRa math (mirrors RadioInterface / MeshRadio.h)
+//==================================================================================
+const HEADER_LEN = 16;        // sizeof(PacketHeader)
+const PREAMBLE   = 16;        // preambleLengthDefault
+const CWmin = 3, CWmax = 8;   // RadioInterface.h
+const TX_QUEUE_CAP = 16;      // MeshPacketQueue size
+const SEEN_MS = 5*60*1000;    // PacketHistory dedup window
+const NOISE_NF = 6;           // receiver noise figure (dB)
+
+// preset -> {sf, bw(kHz), cr(denominator 5..8)}  (modemPresetToParams, sub-GHz)
+const PRESETS = {
+  ShortTurbo :{sf:7 ,bw:500,cr:5}, ShortFast:{sf:7,bw:250,cr:5}, ShortSlow:{sf:8,bw:250,cr:5},
+  MediumFast :{sf:9 ,bw:250,cr:5}, MediumSlow:{sf:10,bw:250,cr:5},
+  LongFast   :{sf:11,bw:250,cr:5}, LongModerate:{sf:11,bw:125,cr:8}, LongSlow:{sf:12,bw:125,cr:8},
+  LongTurbo  :{sf:11,bw:500,cr:8},
+};
+// SX1262 sensitivity @ BW125 (dBm), per spreading factor
+const SENS125 = {7:-124,8:-127,9:-130,10:-133,11:-135,12:-137};
+
+function sensitivity(sf,bw){ return SENS125[sf] + 10*Math.log10(bw/125); }
+function noiseFloor(bw){ return -174 + 10*Math.log10(bw*1000) + NOISE_NF; }
+function symbolTime(sf,bw){ return Math.pow(2,sf)/bw; }   // ms (bw in kHz)
+
+// RadioInterface::computeSlotTimeMsec (non-wide LoRa): max(2.25, NUM_SYM_CAD+0.5)*Tsym + 7.6
+function slotTimeMs(sf,bw){ return Math.max(2.25, 2.5)*symbolTime(sf,bw) + (0.2+0.4+7); }
+
+// Semtech LoRa time-on-air (== RadioLib getTimeOnAir / 1000), plBytes incl. 16B header.
+function toaMs(plBytes,sf,bw,cr){
+  const Tsym = symbolTime(sf,bw);
+  const DE = Tsym >= 16 ? 1 : 0;                 // low-data-rate optimize
+  const Tpre = (PREAMBLE + 4.25) * Tsym;
+  const num = 8*plBytes - 4*sf + 28 + 16*1 - 20*0; // CRC=1, explicit header
+  const den = 4*(sf - 2*DE);
+  const payloadSym = 8 + Math.max(Math.ceil(num/den) * cr, 0); // cr = CR+4 (5..8)
+  return Tpre + payloadSym*Tsym;
+}
+
+// Default.h congestionScalingCoefficient: traffic interval multiplier when >40 nodes
+function congestionCoef(nOnline,sf,bw){
+  if(nOnline<=40) return 1;
+  const throttling = Math.pow(2,sf)/(bw*100);
+  return 1 + (nOnline-40)*throttling;
+}
+
+//==================================================================================
+// 2. World state
+//==================================================================================
+const ROLES = {                       // rebroadcast policy per role (FloodingRouter)
+  SENSOR :{reb:true ,cancel:true ,router:false, color:'--sensor', label:'Sensor'},
+  CLIENT :{reb:true ,cancel:true ,router:false, color:'--client', label:'Client'},
+  ROUTER :{reb:true ,cancel:false,router:true , color:'--router', label:'Router'},
+  ROUTER_LATE:{reb:true,cancel:false,router:false,late:true,color:'--router',label:'Router-late'},
+  CLIENT_MUTE:{reb:false,cancel:true,router:false,color:'--mute', label:'Mute'},
+  GATEWAY:{reb:true ,cancel:true ,router:false,sink:true, color:'--gw', label:'Gateway'},
+};
+let nodes = [];        // {id,x,y,kind, queue[], sending, seen Map, heard[], counters...}
+let nextNodeId = 1;
+let cfg = {};          // pulled from inputs each (re)build
+
+function makeNode(x,y,kind){
+  return {id:nextNodeId++, x,y, kind,
+    queue:[], sending:null, seen:new Map(), heard:[],
+    attemptScheduled:false,
+    tx:0, rxOk:0};
+}
+
+//==================================================================================
+// 3. Discrete-event engine
+//==================================================================================
+// Min-heap keyed by time
+class Heap{
+  constructor(){this.a=[];}
+  get size(){return this.a.length;}
+  push(e){const a=this.a;a.push(e);let i=a.length-1;while(i>0){const p=(i-1)>>1;if(a[p].t<=a[i].t)break;[a[p],a[i]]=[a[i],a[p]];i=p;}}
+  pop(){const a=this.a;const top=a[0];const last=a.pop();if(a.length){a[0]=last;let i=0;for(;;){let l=2*i+1,r=l+1,s=i;if(l<a.length&&a[l].t<a[s].t)s=l;if(r<a.length&&a[r].t<a[s].t)s=r;if(s===i)break;[a[s],a[i]]=[a[i],a[s]];i=s;}}return top;}
+  peek(){return this.a[0];}
+  clear(){this.a.length=0;}
+}
+
+let ev = new Heap();
+let simTime = 0;       // ms
+let nextPktId = 1;
+let activeTx = [];     // recent transmissions {txNode, pkt, start, end}
+let flashes = [];      // {x,y,t,kind} collision/tx markers for rendering
+
+// per-run metric accumulators (reset by resetStats)
+let M = null;
+function resetStats(){
+  M = {origin:0, deliveredGw:0, gwExists:false, coverageSum:0, coverageCnt:0,
+       hopsSum:0, hopsCnt:0, latSum:0, latCnt:0,
+       collisions:0, drops:0, txCount:0, canceled:0,
+       windowStart:simTime, pktTrack:new Map(), hist:[]};
+}
+
+function scheduleAt(t,fn){ ev.push({t,fn}); }
+
+// ---- node helpers ----------------------------------------------------------------
+function nodeUtilPct(n){            // airtime.cpp channelUtilizationPercent (60s window)
+  const cut = simTime - 60000; let sum=0;
+  for(const h of n.heard) if(h.t>=cut) sum+=h.toa;
+  return Math.min(100, sum/60000*100);
+}
+function pruneHeard(n){ const cut=simTime-60000; if(n.heard.length>200||n.heard.length&&n.heard[0].t<cut){ n.heard=n.heard.filter(h=>h.t>=cut);} }
+function seenKey(p){ return p.origin+'/'+p.id; }
+function markSeen(n,p){ n.seen.set(seenKey(p), simTime+SEEN_MS); }
+function wasSeen(n,p){ const e=n.seen.get(seenKey(p)); if(e===undefined)return false; if(e<simTime){n.seen.delete(seenKey(p));return false;} return true; }
+
+// RSSI at receiver r from transmitter tx-node (dBm); null if out of range.
+function rssiBetween(a,b,baseSens){
+  const dx=a.x-b.x, dy=a.y-b.y; let d=Math.sqrt(dx*dx+dy*dy);
+  if(d>cfg.range) return null;
+  d=Math.max(0.5,d);
+  let r = baseSens + 10*cfg.pln*Math.log10(cfg.range/d);
+  if(cfg.sigma>0) r += cfg.sigma*gaussian();
+  return r;
+}
+
+// ---- the firmware-style backoff (RadioInterface.cpp) ------------------------------
+function localTxDelay(n){                       // getTxDelayMsec
+  const cw = amap(nodeUtilPct(n),0,100,CWmin,CWmax);
+  return randInt(Math.pow(2,cw))*cfg.slot;
+}
+function cwFromSnr(snr){ snr=Math.max(-20,Math.min(10,snr)); return amap(snr,-20,10,CWmin,CWmax); } // getCWsize
+function weightedTxDelay(p,role){               // getTxDelayMsecWeighted
+  const cw = cwFromSnr(p.rx_snr);
+  if(role.router) return randInt(2*cw)*cfg.slot;                 // ROUTER: rebroadcast early
+  if(role.late)   return (2*CWmax*cfg.slot) + Math.pow(2,cw)*cfg.slot; // ROUTER_LATE: worst window
+  return (2*CWmax*cfg.slot) + randInt(Math.pow(2,cw))*cfg.slot;  // CLIENT offset
+}
+
+// ---- TX pipeline (mirrors RadioLibInterface onNotify/setTransmitDelay/startSend) ---
+function enqueue(n,p){
+  if(n.queue.length>=TX_QUEUE_CAP){ M.drops++; return; }
+  n.queue.push(p);
+  if(!n.sending && !n.attemptScheduled) setTransmitDelay(n);
+}
+function setTransmitDelay(n){
+  if(!n.queue.length){ n.attemptScheduled=false; return; }
+  const p = n.queue[0];
+  const role = ROLES[n.kind];
+  const delay = p.local ? localTxDelay(n) : weightedTxDelay(p,role);
+  n.attemptScheduled=true;
+  scheduleAt(simTime+Math.max(1,delay), ()=>txAttempt(n));
+}
+function channelBusy(n){                         // isChannelActive(): CAD senses preamble
+  const sens = cfg.sens;
+  for(const t of activeTx){
+    if(t.txNode===n) continue;
+    if(t.start<=simTime && simTime<t.end){
+      if(rssiBetween(n,t.txNode,sens)!==null) return true;
+    }
+  }
+  return false;
+}
+function txAttempt(n){
+  n.attemptScheduled=false;
+  if(n.sending || !n.queue.length) return;
+  if(channelBusy(n)){ setTransmitDelay(n); return; }   // defer like the firmware
+  const p = n.queue.shift();
+  startSend(n,p);
+}
+function startSend(n,p){
+  const toa = toaMs(p.bytes+HEADER_LEN, cfg.sf, cfg.bw, cfg.cr);
+  const tx = {txNode:n, pkt:p, start:simTime, end:simTime+toa};
+  n.sending = tx;
+  activeTx.push(tx);
+  n.tx++; M.txCount++;
+  // count airtime toward everyone who can hear it (incl. self) -> drives their CW
+  addAirtime(n, tx, toa);
+  scheduleAt(tx.end, ()=>txEnd(n,tx));
+}
+function addAirtime(txNode, tx, toa){
+  for(const r of nodes){
+    if(r===txNode){ r.heard.push({t:simTime,toa}); continue; }
+    if(rssiBetween(r,txNode,cfg.sens)!==null) r.heard.push({t:simTime,toa});
+  }
+}
+function txEnd(n,tx){
+  n.sending=null;
+  // remove from active list lazily (pruned elsewhere) but mark ended
+  deliver(tx);
+  // process next queued packet
+  if(n.queue.length) setTransmitDelay(n);
+}
+
+// ---- reception & collision (capture model) ----------------------------------------
+function decodedAt(r,tx){
+  const sens=cfg.sens;
+  const rssiP = rssiBetween(r,tx.txNode,sens);
+  if(rssiP===null) return false;                 // out of range / below sensitivity
+  // half-duplex: r heard nothing it overlapped while transmitting
+  for(const o of activeTx){
+    if(o.txNode!==r) continue;
+    if(o.start<tx.end && tx.start<o.end) return false;
+  }
+  // capture: P must be >= captureDb above every overlapping interferer
+  for(const o of activeTx){
+    if(o===tx || o.txNode===tx.txNode || o.txNode===r) continue;
+    if(o.start<tx.end && tx.start<o.end){
+      const rssiI = rssiBetween(r,o.txNode,sens);
+      if(rssiI!==null && (rssiP - rssiI) < cfg.cap) return false;
+    }
+  }
+  return true;
+}
+function deliver(tx){
+  const p=tx.pkt, src=tx.txNode;
+  let reached=0, reachable=0;
+  for(const r of nodes){
+    if(r===src) continue;
+    const inRange = rssiBetween(r,src,cfg.sens)!==null;
+    if(inRange) reachable++;
+    if(!decodedAt(r,tx)){
+      if(inRange){ M.collisions++; flashes.push({x:r.x,y:r.y,t:simTime,kind:'x'}); }
+      continue;
+    }
+    reached++;
+    receive(r,p,tx);
+  }
+  // coverage = fraction of in-range nodes that decoded this transmission
+  if(p.local && reachable>0){ M.coverageSum += reached/reachable; M.coverageCnt++; }
+}
+function receive(r,p,tx){
+  const role=ROLES[r.kind];
+  // gateway sink: a tracked packet reaching any gateway = delivered (once)
+  if(role.sink && p.track){
+    const t = M.pktTrack.get(seenKey(p));
+    if(t && !t.delivered){
+      t.delivered=true; M.deliveredGw++;
+      M.latSum += (simTime - t.born); M.latCnt++;
+      M.hopsSum += (p.hopStart - p.hopLimit); M.hopsCnt++;
+    }
+  }
+  if(wasSeen(r,p)){
+    // perhapsCancelDupe: CLIENT-like roles drop their own pending rebroadcast
+    if(role.cancel){
+      const i=r.queue.findIndex(q=>seenKey(q)===seenKey(p));
+      if(i>=0){ r.queue.splice(i,1); M.canceled++; }
+    }
+    return;
+  }
+  markSeen(r,p);
+  // perhapsRebroadcast
+  if(role.reb && p.hopLimit>0){
+    const snr = rssiBetween(r,tx.txNode,cfg.sens) - cfg.noise;
+    const copy = {id:p.id, origin:p.origin, type:p.type, track:p.track,
+                  bytes:p.bytes, hopLimit:p.hopLimit-1, hopStart:p.hopStart,
+                  local:false, rx_snr:snr};
+    enqueue(r,copy);
+  }
+}
+
+// ---- origination (Default.h cadence + congestion scaling) -------------------------
+function originate(n,type){
+  const p = {id:nextPktId++, origin:n.id, type, bytes:trafficBytes(type),
+             hopLimit:cfg.hops, hopStart:cfg.hops, local:true, rx_snr:0,
+             track:(type==='telemetry' && n.kind==='SENSOR')};
+  markSeen(n,p);                    // FloodingRouter::send adds our own id to history
+  if(p.track){ M.origin++; M.pktTrack.set(seenKey(p),{born:simTime,delivered:false}); M.gwExists=anyGateway(); }
+  enqueue(n,p);
+  scheduleAt(simTime + nextInterval(n,type), ()=>originate(n,type));
+}
+function trafficBytes(type){
+  if(type==='telemetry') return cfg.payS;
+  if(type==='position')  return 24;
+  return 60; // nodeinfo
+}
+function nextInterval(n,type){     // ms, with +-15% jitter
+  let s;
+  const k=n.kind;
+  if(type==='telemetry') s = (k==='SENSOR')? cfg.iSensor : cfg.iTelem;
+  else if(type==='position') s = cfg.iPos;
+  else s = cfg.iInfo;
+  // congestion scaling: clients scale up; sensors/routers keep priority
+  if(cfg.congest && !ROLES[k].router && k!=='SENSOR' && (type==='telemetry'||type==='position'))
+    s *= congestionCoef(nodes.length, cfg.sf, cfg.bw);
+  const jitter = 0.85 + 0.3*rand();
+  return Math.max(1000, s*1000*jitter);
+}
+function anyGateway(){ return nodes.some(n=>n.kind==='GATEWAY'); }
+
+//==================================================================================
+// 4. Build / reset the simulation from current config + layout
+//==================================================================================
+function readCfg(){
+  const pr = PRESETS[$('preset').value];
+  cfg = {
+    sf:pr.sf, bw:pr.bw, cr:pr.cr,
+    sens:sensitivity(pr.sf,pr.bw), noise:noiseFloor(pr.bw), slot:slotTimeMs(pr.sf,pr.bw),
+    hops:+$('hops').value,
+    range:+$('range').value, pln:+$('pln').value/10, sigma:+$('sig').value/10, cap:+$('cap').value/10,
+    iSensor:+$('iSensor').value, iTelem:+$('iTelem').value, iPos:+$('iPos').value, iInfo:+$('iInfo').value,
+    payS:+$('payS').value, congest:$('congest').checked,
+    speed:+$('spd').value, win:+$('win').value*1000, seed:+$('seed').value,
+    duty:+$('region').value,
+  };
+  $('presetline').textContent = `${$('preset').value} · ${cfg.bw}kHz SF${cfg.sf} · ToA≈${Math.round(toaMs(cfg.payS+HEADER_LEN,cfg.sf,cfg.bw,cfg.cr))}ms · slot ${Math.round(cfg.slot)}ms · sens ${cfg.sens.toFixed(0)}dBm`;
+}
+function rebuildSchedule(){
+  // Re-seed and re-arm all originators + clear in-flight state, keep node positions.
+  RNG = mulberry32(cfg.seed>>>0);
+  ev.clear(); activeTx.length=0; flashes.length=0; simTime=0; nextPktId=1;
+  for(const n of nodes){ n.queue.length=0; n.sending=null; n.seen.clear(); n.heard.length=0; n.attemptScheduled=false; n.tx=0; n.rxOk=0; }
+  resetStats();
+  for(const n of nodes){
+    // stagger initial originations across each interval (random phase)
+    scheduleAt(rand()*cfg.iInfo*1000, ()=>originate(n,'nodeinfo'));
+    const tInt = (n.kind==='SENSOR')?cfg.iSensor:cfg.iTelem;
+    scheduleAt(rand()*tInt*1000, ()=>originate(n,'telemetry'));
+    if(n.kind!=='SENSOR' && n.kind!=='GATEWAY' && !ROLES[n.kind].router)
+      scheduleAt(rand()*cfg.iPos*1000, ()=>originate(n,'position'));
+  }
+}
+function fullReset(){ readCfg(); rebuildSchedule(); }
+
+//==================================================================================
+// 5. Engine stepping
+//==================================================================================
+function runUntil(target){
+  let guard=0;
+  while(ev.size && ev.peek().t<=target){
+    const e=ev.pop(); simTime=e.t; e.fn();
+    if(++guard>500000){ break; } // safety
+  }
+  simTime=target;
+  // prune the active-tx and flash lists
+  if(activeTx.length>400) activeTx=activeTx.filter(t=>t.end>simTime-2000);
+  // rolling history sample for the live chart
+  if(simTime - (M.hist.length? M.hist[M.hist.length-1].t:0) >= 1000){
+    M.hist.push({t:simTime, pdr:curPDR(), util:meanUtil()});
+    if(M.hist.length>600) M.hist.shift();
+  }
+}
+function curPDR(){ if(!M.gwExists||M.origin===0) return null; return 100*M.deliveredGw/M.origin; }
+function meanUtil(){ if(!nodes.length)return 0; let s=0; for(const n of nodes)s+=nodeUtilPct(n); return s/nodes.length; }
+function maxUtil(){ let m=0; for(const n of nodes)m=Math.max(m,nodeUtilPct(n)); return m; }
+
+//==================================================================================
+// 6. Rendering
+//==================================================================================
+const cv=$('net'), ctx=cv.getContext('2d');
+function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function fitCanvas(c){ const r=c.getBoundingClientRect(), dpr=devicePixelRatio||1;
+  c.width=r.width*dpr; c.height=r.height*dpr; const x=c.getContext('2d'); x.setTransform(dpr,0,0,dpr,0,0); return r; }
+let stageRect;
+function resize(){ stageRect=fitCanvas(cv); fitCanvas($('chart')); fitCanvas($('sweep')); draw(); drawChart(); drawSweep(); }
+window.addEventListener('resize',resize);
+
+function utilColor(u){ // green -> amber -> red
+  const t=Math.min(1,u/60);
+  if(t<0.5){ const k=t/0.5; return `rgb(${Math.round(90+120*k)},${Math.round(209-40*k)},${Math.round(127-30*k)})`; }
+  const k=(t-0.5)/0.5; return `rgb(${Math.round(210+45*k)},${Math.round(169-90*k)},${Math.round(97-30*k)})`;
+}
+function draw(){
+  if(!stageRect) return;
+  const W=stageRect.width,H=stageRect.height;
+  ctx.clearRect(0,0,W,H);
+  // links between in-range neighbours (faint)
+  ctx.strokeStyle='rgba(120,140,180,0.07)'; ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+    const a=nodes[i],b=nodes[j],dx=a.x-b.x,dy=a.y-b.y;
+    if(dx*dx+dy*dy<=cfg.range*cfg.range){ ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); }
+  }
+  ctx.stroke();
+  // active transmissions: expanding ring + reception links
+  for(const t of activeTx){
+    if(simTime<t.start||simTime>=t.end) continue;
+    const prog=(simTime-t.start)/(t.end-t.start);
+    ctx.strokeStyle=`rgba(70,224,192,${0.5*(1-prog)})`; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(t.txNode.x,t.txNode.y, cfg.range*prog, 0, 7); ctx.stroke();
+  }
+  // collision flashes
+  for(const f of flashes){ const age=simTime-f.t; if(age>400)continue;
+    ctx.strokeStyle=`rgba(255,93,108,${1-age/400})`; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(f.x-5,f.y-5);ctx.lineTo(f.x+5,f.y+5);ctx.moveTo(f.x+5,f.y-5);ctx.lineTo(f.x-5,f.y+5); ctx.stroke();
+  }
+  flashes = flashes.filter(f=>simTime-f.t<=400);
+  // selected node range ring
+  if(selected){ ctx.strokeStyle='rgba(70,224,192,0.35)'; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.arc(selected.x,selected.y,cfg.range,0,7); ctx.stroke(); ctx.setLineDash([]); }
+  // nodes
+  for(const n of nodes){
+    const role=ROLES[n.kind]; const u=nodeUtilPct(n);
+    // util halo
+    if(running||u>0){ ctx.fillStyle=`rgba(255,180,84,${Math.min(.35,u/200)})`;
+      ctx.beginPath(); ctx.arc(n.x,n.y,9+u/6,0,7); ctx.fill(); }
+    ctx.fillStyle=css(role.color);
+    ctx.beginPath(); ctx.arc(n.x,n.y, n.kind==='GATEWAY'?7:5, 0, 7); ctx.fill();
+    if(n.kind==='GATEWAY'||n.kind==='ROUTER'){ ctx.strokeStyle='#0c0e14'; ctx.lineWidth=1.5; ctx.stroke(); }
+    if(n.sending){ ctx.strokeStyle=css('--accent'); ctx.lineWidth=2; ctx.beginPath(); ctx.arc(n.x,n.y,9,0,7); ctx.stroke(); }
+  }
+  if(selected){ ctx.strokeStyle=css('--ink'); ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(selected.x,selected.y,11,0,7); ctx.stroke(); }
+}
+
+// live time-series chart (PDR + util)
+function drawChart(){
+  const c=$('chart'),x=c.getContext('2d'),r=c.getBoundingClientRect();
+  x.clearRect(0,0,r.width,r.height);
+  const H=r.height,Wc=r.width;
+  x.strokeStyle=css('--grid'); x.lineWidth=1;
+  for(let p=0;p<=100;p+=25){const y=H-(p/100)*H; x.beginPath();x.moveTo(0,y);x.lineTo(Wc,y);x.stroke();}
+  if(!M||!M.hist.length)return;
+  const n=M.hist.length, step=Wc/Math.max(1,n-1);
+  const line=(key,color)=>{ x.strokeStyle=color;x.lineWidth=2;x.beginPath();let started=false;
+    M.hist.forEach((h,i)=>{ const v=h[key]; if(v==null){started=false;return;}
+      const y=H-(Math.min(100,v)/100)*H, xx=i*step; if(!started){x.moveTo(xx,y);started=true;}else x.lineTo(xx,y); }); x.stroke(); };
+  line('util',css('--warn')); line('pdr',css('--good'));
+}
+
+// densify sweep chart
+let sweepData=[];
+function drawSweep(){
+  const c=$('sweep'),x=c.getContext('2d'),r=c.getBoundingClientRect();
+  x.clearRect(0,0,r.width,r.height); const H=r.height,Wc=r.width;
+  x.strokeStyle=css('--grid');x.lineWidth=1;
+  for(let p=0;p<=100;p+=25){const y=H-(p/100)*H;x.beginPath();x.moveTo(0,y);x.lineTo(Wc,y);x.stroke();}
+  if(sweepData.length<1)return;
+  const maxN=Math.max(...sweepData.map(d=>d.nodes),1);
+  const X=n=>(n/maxN)*Wc, Y=v=>H-(Math.min(100,v)/100)*H;
+  const line=(key,color)=>{x.strokeStyle=color;x.lineWidth=2;x.beginPath();
+    sweepData.forEach((d,i)=>{const xx=X(d.nodes),y=Y(d[key]??0);i?x.lineTo(xx,y):x.moveTo(xx,y);});x.stroke();
+    x.fillStyle=color; sweepData.forEach(d=>{x.beginPath();x.arc(X(d.nodes),Y(d[key]??0),2.5,0,7);x.fill();});};
+  line('util',css('--warn')); line('pdr',css('--good'));
+  x.fillStyle=css('--dim');x.font='10px ui-monospace';
+  x.fillText('0',2,H-2); x.fillText(maxN+' nodes',Wc-54,H-2);
+}
+
+function updateMetrics(){
+  $('m-nodes').textContent=nodes.length;
+  const sensors=nodes.filter(n=>n.kind==='SENSOR').length, gws=nodes.filter(n=>n.kind==='GATEWAY').length;
+  $('m-sg').textContent=`${sensors}/${gws}`;
+  const pdr=curPDR();
+  $('m-pdr').innerHTML = pdr==null? (gws?'&mdash; <small>%</small>':'<small style="color:var(--dim)">no gateway</small>')
+                                 : pdr.toFixed(0)+' <small>%</small>';
+  $('m-pdr').style.color = pdr==null?'':(pdr>80?css('--good'):pdr>50?css('--warn'):css('--bad'));
+  const cov = M.coverageCnt? 100*M.coverageSum/M.coverageCnt:null;
+  $('m-cov').innerHTML = cov==null?'&mdash; <small>%</small>':cov.toFixed(0)+' <small>%</small>';
+  const elapsedMin = Math.max(1/60,(simTime-M.windowStart)/60000);
+  $('m-off').innerHTML = (M.origin/elapsedMin).toFixed(1)+' <small>/min</small>';
+  $('m-util').innerHTML = meanUtil().toFixed(0)+' <small>%</small>';
+  $('m-utilmax').innerHTML = maxUtil().toFixed(0)+' <small>%</small>';
+  const secs=Math.max(1,(simTime-M.windowStart)/1000);
+  $('m-coll').innerHTML=(M.collisions/secs).toFixed(1)+' <small>/s</small>';
+  $('m-drop').innerHTML=(M.drops/secs).toFixed(1)+' <small>/s</small>';
+  $('m-hops').textContent = M.hopsCnt? (M.hopsSum/M.hopsCnt).toFixed(1):'—';
+  $('m-lat').innerHTML = M.latCnt? Math.round(M.latSum/M.latCnt)+' <small>ms</small>':'&mdash; <small>ms</small>';
+  $('hud').textContent=`sim ${(simTime/1000).toFixed(1)}s · ${nodes.length} nodes · ${running?'running '+cfg.speed+'×':'paused'}`;
+}
+
+//==================================================================================
+// 7. Run loop
+//==================================================================================
+let running=false, lastWall=0;
+function loop(ts){
+  if(!running) return;
+  if(!lastWall) lastWall=ts;
+  const dt=Math.min(100, ts-lastWall); lastWall=ts;
+  runUntil(simTime + dt*cfg.speed);
+  draw(); drawChart(); updateMetrics();
+  requestAnimationFrame(loop);
+}
+function play(){ if(running)return; readCfg(); running=true; lastWall=0; $('btnPlay').innerHTML='&#10073;&#10073; Pause'; requestAnimationFrame(loop); }
+function pause(){ running=false; $('btnPlay').innerHTML='&#9654; Run'; }
+$('btnPlay').onclick=()=> running?pause():play();
+$('btnStep').onclick=()=>{ pause(); readCfg(); runUntil(simTime+1000); draw(); drawChart(); updateMetrics(); };
+$('btnReset').onclick=()=>{ pause(); fullReset(); draw(); drawChart(); updateMetrics(); };
+$('btnClear').onclick=()=>{ pause(); nodes=[]; selected=null; fullReset(); refreshSelPanel(); draw(); drawChart(); updateMetrics(); };
+
+//==================================================================================
+// 8. Canvas interaction (place / drag / delete / select)
+//==================================================================================
+let brush='SENSOR', selected=null, dragging=null, dragMoved=false, downPt=null;
+function nodeAt(x,y){ for(let i=nodes.length-1;i>=0;i--){const n=nodes[i],dx=n.x-x,dy=n.y-y; if(dx*dx+dy*dy<=100)return n;} return null; }
+function evPos(e){ const r=cv.getBoundingClientRect(); return {x:e.clientX-r.left, y:e.clientY-r.top}; }
+cv.addEventListener('mousedown',e=>{ const p=evPos(e); const hit=nodeAt(p.x,p.y); downPt=p; dragMoved=false;
+  if(hit){ if(e.shiftKey){ removeNode(hit); } else { dragging=hit; selected=hit; refreshSelPanel(); } }
+  else if(!e.shiftKey){ const n=makeNode(p.x,p.y,brush); nodes.push(n); selected=n; armNode(n); refreshSelPanel(); }
+  draw();
+});
+window.addEventListener('mousemove',e=>{ if(!dragging)return; const p=evPos(e); dragging.x=p.x; dragging.y=p.y; dragMoved=true; draw(); });
+window.addEventListener('mouseup',()=>{ dragging=null; });
+function removeNode(n){ nodes=nodes.filter(x=>x!==n); if(selected===n)selected=null; refreshSelPanel(); draw(); updateMetrics(); }
+// When a node is added mid-run, arm its originators so it joins live.
+function armNode(n){
+  if(!M) return;
+  scheduleAt(simTime+rand()*cfg.iInfo*1000, ()=>originate(n,'nodeinfo'));
+  const tInt=(n.kind==='SENSOR')?cfg.iSensor:cfg.iTelem;
+  scheduleAt(simTime+rand()*tInt*1000, ()=>originate(n,'telemetry'));
+  if(n.kind!=='SENSOR'&&n.kind!=='GATEWAY'&&!ROLES[n.kind].router)
+    scheduleAt(simTime+rand()*cfg.iPos*1000, ()=>originate(n,'position'));
+  updateMetrics();
+}
+
+// selection panel (role change / delete) injected under brushes
+function refreshSelPanel(){
+  let host=$('selpanel');
+  if(!host){ host=document.createElement('div'); host.id='selpanel'; host.style.marginTop='8px';
+    $('brushes').parentNode.insertBefore(host,$('brushes').nextSibling.nextSibling); }
+  if(!selected){ host.innerHTML=''; return; }
+  host.innerHTML=`<div class="note">Selected #${selected.id} —
+    <select id="selRole"></select> <button id="selDel" class="warn">del</button></div>`;
+  const sel=$('selRole'); for(const k in ROLES){ const o=document.createElement('option'); o.value=k; o.textContent=ROLES[k].label; if(k===selected.kind)o.selected=true; sel.appendChild(o); }
+  sel.onchange=()=>{ selected.kind=sel.value; draw(); updateMetrics(); };
+  $('selDel').onclick=()=>removeNode(selected);
+}
+
+//==================================================================================
+// 9. Layout helpers (fill / grid / ring)
+//==================================================================================
+function area(){ const r=stageRect; return {w:r.width, h:r.height, pad:30}; }
+$('btnFill').onclick=()=>{ const a=area(); const N=+$('fillN').textContent;
+  for(let i=0;i<N;i++){ const n=makeNode(a.pad+Math.random()*(a.w-2*a.pad), a.pad+Math.random()*(a.h-2*a.pad), brush); nodes.push(n); armNode(n);} draw(); updateMetrics(); };
+$('btnGrid').onclick=()=>{ const a=area(); const cols=Math.ceil(Math.sqrt(+$('fillN').textContent*a.w/a.h));
+  const rows=Math.ceil(+$('fillN').textContent/cols); const sx=(a.w-2*a.pad)/Math.max(1,cols-1), sy=(a.h-2*a.pad)/Math.max(1,rows-1);
+  let c=0; for(let r=0;r<rows;r++)for(let col=0;col<cols;col++){ if(c++>=+$('fillN').textContent)break;
+    const n=makeNode(a.pad+col*sx, a.pad+r*sy, brush); nodes.push(n); armNode(n);} draw(); updateMetrics(); };
+$('btnRing').onclick=()=>{ const a=area(); const N=+$('fillN').textContent, cx=a.w/2, cy=a.h/2, R=Math.min(a.w,a.h)/2-a.pad;
+  for(let i=0;i<N;i++){ const t=2*Math.PI*i/N; const n=makeNode(cx+R*Math.cos(t), cy+R*Math.sin(t), brush); nodes.push(n); armNode(n);} draw(); updateMetrics(); };
+
+//==================================================================================
+// 10. Densify sweep (headless, fast)
+//==================================================================================
+let sweeping=false;
+$('btnSweep').onclick=async ()=>{
+  if(sweeping)return; sweeping=true; pause(); readCfg();
+  const step=+$('swStep').value, maxN=+$('swMax').value, warm=cfg.win/2, meas=cfg.win;
+  sweepData=[]; drawSweep();
+  // ensure at least one gateway exists for PDR
+  if(!anyGateway()){ const a=area(); const g=makeNode(a.w/2,a.h/2,'GATEWAY'); nodes.push(g); }
+  while(sweeping && nodes.length<=maxN){
+    fullReset();
+    runUntil(warm);                 // warm-up: let intervals & util settle
+    resetStats(); M.gwExists=anyGateway();
+    runUntil(simTime+meas);         // measurement window
+    sweepData.push({nodes:nodes.length, pdr:curPDR()??0, util:meanUtil()});
+    drawSweep(); draw(); updateMetrics();
+    await new Promise(r=>setTimeout(r,0));  // yield to UI
+    // densify: add `step` random nodes of the current brush
+    const a=area();
+    for(let i=0;i<step && nodes.length<maxN+step;i++)
+      nodes.push(makeNode(a.pad+Math.random()*(a.w-2*a.pad), a.pad+Math.random()*(a.h-2*a.pad), brush));
+  }
+  sweeping=false;
+};
+$('btnSweepStop').onclick=()=>{ sweeping=false; };
+
+//==================================================================================
+// 11. Wire up controls
+//==================================================================================
+function buildPresetSelect(){ const s=$('preset'); for(const k in PRESETS){const o=document.createElement('option');o.value=k;o.textContent=k;if(k==='LongFast')o.selected=true;s.appendChild(o);} }
+function buildBrushes(){
+  const host=$('brushes');
+  for(const k in ROLES){ const b=document.createElement('div'); b.className='brush'+(k===brush?' sel':''); b.dataset.k=k;
+    b.innerHTML=`<span class="sw" style="background:${css(ROLES[k].color)}"></span>${ROLES[k].label}`;
+    b.onclick=()=>{ brush=k; document.querySelectorAll('.brush').forEach(x=>x.classList.toggle('sel',x.dataset.k===k)); };
+    host.appendChild(b); }
+}
+function buildLegend(){ const l=$('legend'); l.innerHTML='';
+  for(const k in ROLES){ const s=document.createElement('span'); s.innerHTML=`<span class="sw" style="background:${css(ROLES[k].color)}"></span>${ROLES[k].label}`; l.appendChild(s);} }
+
+function bindRange(id,vid,fmt){ const e=$(id); const upd=()=>{$(vid).textContent=fmt(+e.value); readCfg(); draw();}; e.oninput=upd; upd(); }
+function init(){
+  buildPresetSelect(); buildBrushes(); buildLegend();
+  $('preset').onchange=()=>{ readCfg(); draw(); };
+  bindRange('range','rangeV',v=>v);
+  bindRange('pln','plnV',v=>(v/10).toFixed(1));
+  bindRange('sig','sigV',v=>(v/10).toFixed(1)+' dB');
+  bindRange('cap','capV',v=>(v/10).toFixed(1)+' dB');
+  bindRange('spd','spdV',v=>v+'×');
+  for(const id of ['hops','region','iSensor','iTelem','iPos','iInfo','payS','congest','win','seed'])
+    $(id).addEventListener('change',()=>{ readCfg(); });
+  // fill-count quick control: scroll the Fill button text via prompt-less +/- is overkill; keep fixed 25
+  resize(); fullReset();
+  // seed a tiny starter scene so the canvas isn't empty
+  const a=area();
+  nodes.push(makeNode(a.w*0.5,a.h*0.5,'GATEWAY'));
+  for(let i=0;i<6;i++) nodes.push(makeNode(a.pad+Math.random()*(a.w-2*a.pad),a.pad+Math.random()*(a.h-2*a.pad),'SENSOR'));
+  fullReset(); draw(); drawChart(); updateMetrics();
+}
+init();
+</script>
+</body>
+</html>

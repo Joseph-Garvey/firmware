@@ -1,3 +1,7 @@
+# Local broker credentials read by slm_dashboard.html. Secret -- keep it local;
+# dashboard-config.example.json is the committed placeholder template.
+dashboard-config.json
+
 # Per-deployment node-ID -> name map, auto-loaded by mqtt_slm_bridge.py.
 # Not secret, but deployment-specific -- keep it local; slm-labels.example.json
 # is the committed template.
