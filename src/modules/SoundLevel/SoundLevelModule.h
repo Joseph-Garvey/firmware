@@ -47,17 +47,32 @@ class SoundLevelModule : public SinglePortModule,
 
   private:
     bool startCapture();   // one-time I2S + task bring-up (lazy, on first runOnce)
-    void drainBaseIntervals();
+    bool drainBaseIntervals();   // returns true if a fresh base interval landed this call
     bool dutyAllows();
     void sendSpectrum();
+#ifdef SLM_FOH_STREAM
+    void sendLiveSpectrum();   // local-client (BLE/serial/TCP) high-rate frame, no LoRa
+#endif
 
     bool started = false;
     bool captureOk = false;       // mic is up; gates the UI frame
     uint32_t windowStartMs = 0;   // millis() when the current averaging window opened
 
-#if HAS_SCREEN
-    // Most-recent base interval (~1 s), kept for the live meter. Owned by the
-    // consumer thread (runOnce/drawFrame both run on the main loop, no locks).
+#ifdef SLM_FS_LOG
+    // On-device anomaly log to LittleFS (downloadable via the WiFi web server). Records
+    // only edge events — buffer drops and crest/level excursions — so a deployed node
+    // can be diagnosed long after the fact without a tethered host. See the .cpp.
+    void fsAppend(const char *tag, float la, float crest, float rawDbfs, uint32_t ovf);
+    uint32_t lastFsOvf = 0;       // overflow count at the previous drain (drop edge detect)
+    bool fsAnomActive = false;    // currently inside a crest/level excursion
+    uint32_t fsLastWriteMs = 0;   // throttle for the sustained-excursion heartbeat
+    uint32_t fsDropWriteMs = 0;   // throttle for repeated drop events
+#endif
+
+#if HAS_SCREEN || defined(SLM_FOH_STREAM)
+    // Most-recent base interval, kept for the live on-device meter and/or the FoH
+    // high-rate stream. Owned by the consumer thread (runOnce/drawFrame both run on
+    // the main loop, no locks).
     double dispE[OCT_NUM_BANDS] = {0};
     uint32_t dispBlocks = 0;
 #endif
