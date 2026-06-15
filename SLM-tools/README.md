@@ -4,7 +4,7 @@ Consumer-side tooling for the SoundLevelModule: take the raw `PRIVATE_APP` spect
 packets off the mesh and turn them into readable dB values on MQTT.
 
 - [mqtt_slm_bridge.py](mqtt_slm_bridge.py) — decode + republish bridge for the **mesh /
-  command-center** path (the `tools/mqtt_slm_bridge.py` referenced by the broker config).
+  command-center** path (the `SLM-tools/mqtt_slm_bridge.py` referenced by the broker config).
 - [foh_client_bridge.py](foh_client_bridge.py) — decode + republish bridge for the
   **front-of-house** path: reads the high-rate stream straight off a node's client API
   (USB / BLE / TCP). See [Front-of-house live stream](#front-of-house-live-stream) below.
@@ -43,7 +43,7 @@ packets off the mesh and turn them into readable dB values on MQTT.
                  │                                            │
                  └──────────────┬─────────────────────────────┘
                                 ▼
-                    tools/mqtt_slm_bridge.py
+                    SLM-tools/mqtt_slm_bridge.py
                     ServiceEnvelope → MeshPacket → Data
                     filter portnum==PRIVATE_APP, parse 35-byte v2 frame
                     dB = byte / 2,  band centers from fixed IEC table
@@ -70,13 +70,13 @@ multi-node deployment readable:
   to exceed the spread between gateways relaying the same packet (seconds); it is
   well under the ≥15s sensor transmit spacing, so legitimate next frames (which
   carry a *new* id) are never suppressed. The cache is **persisted** to
-  `tools/.slm-dedup-state.json` (override with `--dedup-state FILE`, empty string to
+  `SLM-tools/.slm-dedup-state.json` (override with `--dedup-state FILE`, empty string to
   disable), so a quick bridge restart mid relay-window still drops the second copy;
   only entries newer than the TTL are restored. On startup the bridge logs
   `[dedup] restored N recent packet id(s)` when it picks state back up.
-- **Labels (`tools/slm-labels.json`).** Map raw node IDs to names so the console and
+- **Labels (`SLM-tools/slm-labels.json`).** Map raw node IDs to names so the console and
   the republished JSON carry a `label` (e.g. `Workshop`) instead of just `!4f4aece2`.
-  The bridge auto-loads `tools/slm-labels.json` if it exists — copy the committed
+  The bridge auto-loads `SLM-tools/slm-labels.json` if it exists — copy the committed
   [slm-labels.example.json](slm-labels.example.json) and edit. Use the same name you
   gave each meter as `owner_short` in
   [provisioning/slm-node.yaml](../src/modules/SoundLevel/provisioning/slm-node.yaml).
@@ -85,9 +85,9 @@ multi-node deployment readable:
   the label rides in the payload.
 
 ```sh
-cp tools/slm-labels.example.json tools/slm-labels.json    # then edit node IDs -> names
+cp SLM-tools/slm-labels.example.json SLM-tools/slm-labels.json    # then edit node IDs -> names
 # bridge picks it up automatically -- no flag needed:
-.venv/bin/python tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemXXXX \
+.venv/bin/python SLM-tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemXXXX \
     --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 ```
 
@@ -125,7 +125,7 @@ the name you'll map to its node ID in the next step.
 ### 1b. Label the meters (optional but recommended)
 So decoded frames read `Workshop` instead of `!4f4aece2`:
 ```sh
-cp tools/slm-labels.example.json tools/slm-labels.json   # then edit: "!<nodeid>": "Name"
+cp SLM-tools/slm-labels.example.json SLM-tools/slm-labels.json   # then edit: "!<nodeid>": "Name"
 ```
 Find each meter's node ID from `meshtastic --info` or its MQTT topic
 (`.../2/e/<chan>/<!nodeid>`). The bridge auto-loads this file (step 4) — no flag
@@ -145,7 +145,7 @@ Either way: `mqtt.enabled true`, `mqtt.encryption_enabled false`, `mqtt.root TA/
 ### 3. Start the local broker (for republished JSON, and for transport B)
 ```sh
 mosquitto_passwd -c /opt/homebrew/etc/mosquitto/passwd slm     # one-time, sets the password
-mosquitto -c tools/mosquitto-slm.conf -v                        # leave running
+mosquitto -c SLM-tools/mosquitto-slm.conf -v                        # leave running
 ```
 The shipped config also opens a **WebSockets listener on 9001** (for the dashboard —
 browsers can't speak raw MQTT/TCP) and enables **persistence** so retained frames
@@ -156,11 +156,11 @@ subscriber gets it immediately instead of waiting ~15s for the next uplink.
 ### 4. Run the bridge
 ```sh
 # Transport A — client proxy over USB (keep it running; it IS the proxy host)
-.venv/bin/python tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemXXXX \
+.venv/bin/python SLM-tools/mqtt_slm_bridge.py --serial /dev/cu.usbmodemXXXX \
     --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 
 # Transport B — subscribe to the gateway's broker
-.venv/bin/python tools/mqtt_slm_bridge.py --broker <broker-ip> \
+.venv/bin/python SLM-tools/mqtt_slm_bridge.py --broker <broker-ip> \
     --broker-user slm --broker-pass <pw> --in-root TA/SLM \
     --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 ```
@@ -173,7 +173,7 @@ mosquitto_sub -h 127.0.0.1 -u slm -P slmdebug123 -t 'TA/SLM/decoded/#' -C 1
 You should see a frame every ~15s with 31 `levels_db` values, and a `label` field
 carrying the name from `slm-labels.json` (or `null` if the node isn't mapped). The
 console also prints an ASCII spectrum per frame, headed by `!<node> (Label)`. On
-startup the bridge logs `[labels] loaded tools/slm-labels.json` if the file was
+startup the bridge logs `[labels] loaded SLM-tools/slm-labels.json` if the file was
 found.
 
 ## Front-of-house live stream
@@ -192,23 +192,33 @@ The same node still broadcasts the slow integrated frame to the command center o
 LoRa, unchanged — see *Front-of-house live streaming* in
 [../src/modules/SoundLevel/README.md](../src/modules/SoundLevel/README.md).
 
-[foh_client_bridge.py](foh_client_bridge.py) is the consumer for this path. It connects
-over the client API, decodes the **identical v2 frame** (via the shared
-[slm_frame.py](slm_frame.py)), prints an ASCII spectrum, and — with `--out-broker` —
-republishes the **same `TA/SLM/decoded/<node>` JSON** the MQTT bridge does, so the
-[live dashboard](#live-dashboard) visualizes the FoH feed with zero changes.
+> **Who consumes this in production:** the standalone **FoH app** (`noise app/apps/foh`),
+> which embeds the decode in-process (`MeshtasticSource` → `slm_frame.parse_v2`) and
+> renders LAeq dials directly off USB — **no broker, no bridge, nothing in this directory.**
+> The engineer just runs the app. See its `FOH_INTEGRATION.md` reference here for the
+> wire format and receive pattern.
+>
+> `foh_client_bridge.py` below is therefore a **debug / verification tool**, not the FoH
+> workflow: use it to confirm a node is actually streaming, or to drive the bundled
+> `slm_dashboard.html` without writing UI.
+
+[foh_client_bridge.py](foh_client_bridge.py) connects over the client API, decodes the
+**identical v2 frame** (via the shared [slm_frame.py](slm_frame.py)), prints an ASCII
+spectrum, and — with `--out-broker` — republishes the **same `TA/SLM/decoded/<node>`
+JSON** the MQTT bridge does, so the [live dashboard](#live-dashboard) can visualize the
+FoH feed with zero changes.
 
 ```sh
 # Watch live frames over USB (auto-detect port) — no broker needed:
-.venv/bin/python tools/foh_client_bridge.py --serial
+.venv/bin/python SLM-tools/foh_client_bridge.py --serial
 
 # Feed the dashboard from the FoH feed (fully local, no internet):
-.venv/bin/python tools/foh_client_bridge.py --serial \
+.venv/bin/python SLM-tools/foh_client_bridge.py --serial \
     --out-broker 127.0.0.1 --out-user slm --out-pass slmdebug123
 
 # BLE (pair first) or TCP (WiFi-joined node):
-.venv/bin/python tools/foh_client_bridge.py --ble AA:BB:CC:DD:EE:FF
-.venv/bin/python tools/foh_client_bridge.py --tcp 10.0.0.42
+.venv/bin/python SLM-tools/foh_client_bridge.py --ble AA:BB:CC:DD:EE:FF
+.venv/bin/python SLM-tools/foh_client_bridge.py --tcp 10.0.0.42
 ```
 
 Notes specific to this path:
@@ -239,9 +249,9 @@ bridge republishes — no extra server-side code, just the broker's 9001 listene
 
 ### Run it
 The page can't be opened over `file://` (the MQTT client won't load), so serve the
-`tools/` dir over HTTP:
+`SLM-tools/` dir over HTTP:
 ```sh
-cd tools && python3 -m http.server 8000
+cd SLM-tools && python3 -m http.server 8000
 open http://127.0.0.1:8000/slm_dashboard.html
 ```
 Prerequisites: the broker's WebSockets listener (`listener 9001` / `protocol
@@ -257,7 +267,7 @@ Copy [dashboard-config.example.json](dashboard-config.example.json) →
 `dashboard-config.json` with your local broker creds for a no-prompt demo.
 
 ### Notes
-- **mqtt.js is vendored** at `tools/mqtt.min.js` (pinned `mqtt@5.10.1`) — no CDN
+- **mqtt.js is vendored** at `SLM-tools/mqtt.min.js` (pinned `mqtt@5.10.1`) — no CDN
   dependency, works offline, no third-party script trust.
 - **Retained ≠ live.** Because frames are retained, the broker serves the last
   spectrum even after the sensor goes quiet. The "Last frame" readout turns amber

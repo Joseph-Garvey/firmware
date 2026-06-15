@@ -190,12 +190,12 @@ the MQTT broker:
                                  │
                                  ▼
         consumer that knows PRIVATE_APP + the v2 wire format
-        (e.g. tools/mqtt_slm_bridge.py) → readable JSON / spectrum
+        (e.g. SLM-tools/mqtt_slm_bridge.py) → readable JSON / spectrum
 ```
 
 The transport from the bridging node to the broker is either direct WiFi or a
 USB **client proxy** (a paired phone/PC relays MQTT for the node); both carry the
-same `ServiceEnvelope`. See [tools/](../../../tools/README.md) for the fully
+same `ServiceEnvelope`. See [SLM-tools/](../../../SLM-tools/README.md) for the fully
 annotated version of this diagram including both transports and the decode side.
 
 SLM has no dedicated MQTT code — it just relies on the firmware's normal
@@ -245,7 +245,7 @@ payloads to parse.
 
 A ready-made bridge that does exactly this — decode the `ServiceEnvelope`, parse
 the v2 frame, and republish readable JSON — plus an end-to-end setup guide and
-dataflow diagram live in [tools/](../../../tools/README.md). It supports both a
+dataflow diagram live in [SLM-tools/](../../../SLM-tools/README.md). It supports both a
 WiFi gateway (subscribe to a broker) and the more reliable USB **client-proxy**
 transport (no WiFi). See that README for why client proxy is preferred (Meshtastic
 MQTT has no store-and-forward, so dropped-WiFi frames are lost).
@@ -266,7 +266,7 @@ broker is N LoRa hops away, the frame costs those N forwarding transmissions
 regardless of how many gateways are nearby — reaching a gateway is itself a LoRa
 hop (see [Transmission](#transmission)). Extra near-sensor gateways just create
 *more* nodes that each uplink the same packet, which is why the bridge needs the
-`(from, MeshPacket.id)` dedup (see [tools/](../../../tools/README.md)). Gateway
+`(from, MeshPacket.id)` dedup (see [SLM-tools/](../../../SLM-tools/README.md)). Gateway
 placement changes *who* mirrors to MQTT, not the RF cost.
 
 ### How the two addressing modes cost airtime
@@ -418,7 +418,7 @@ no duty-cycle cost**. Properties:
 
 - Same `PRIVATE_APP` port and **same [v2 wire format](#wire-format-v2-35-bytes)**
   as the mesh frame, so the FoH app decodes it with the exact same parser used
-  by the MQTT bridge in [tools/](../../../tools/README.md). The `window_seconds`
+  by the MQTT bridge in [SLM-tools/](../../../SLM-tools/README.md). The `window_seconds`
   field is sub-second for an instantaneous frame (rounds toward 0) and the FoH
   app ignores it.
 - Emitted only while a client is actually connected (the BLE/serial/TCP

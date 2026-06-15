@@ -38,8 +38,18 @@ from slm_frame import CENTERS, fmt_hz, parse_v2   # shared v2 decode (also used 
 PRIVATE_APP = portnums_pb2.PortNum.PRIVATE_APP  # 256
 
 
-def on_receive(packet=None, interface=None, args=None, out=None):
+# pypubsub keeps only a WEAK reference to a subscribed listener, so the callback has to be
+# a module-level function that stays alive here. An inline lambda/closure passed straight to
+# subscribe() has no other reference, gets garbage-collected right after subscribe() returns,
+# and then silently never fires (the node streams, but nothing is decoded). args/out are
+# stashed as module globals so the bare function can reach them.
+_ARGS = None
+_OUT = None
+
+
+def on_receive(packet=None, interface=None):
     """pubsub callback for every packet the node hands up the client API."""
+    args, out = _ARGS, _OUT
     dec = packet.get("decoded") if isinstance(packet, dict) else None
     if not dec:
         return  # encrypted / undecodable — FoH frames are always local & cleartext
@@ -120,9 +130,10 @@ def main():
     if args.serial is None and extra and not extra[0].startswith("-"):
         args.serial = extra[0]
 
-    out = make_out(args)
-    pub.subscribe(lambda packet=None, interface=None: on_receive(packet, interface, args, out),
-                  "meshtastic.receive")
+    global _ARGS, _OUT
+    _ARGS = args
+    _OUT = make_out(args)
+    pub.subscribe(on_receive, "meshtastic.receive")
     iface = open_interface(args)
     print("[ready] streaming FoH frames -- Ctrl-C to stop")
     try:

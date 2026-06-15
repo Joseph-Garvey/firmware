@@ -1,11 +1,19 @@
 # Front-of-house app integration — handoff
 
-**Goal:** pipe *real* SLM frames from a node into the existing FoH app (which
-currently runs on synthetic data). This document is the spec for that wiring.
+> **STATUS: implemented.** The FoH app (`noise app/apps/foh`, class
+> `MeshtasticSource` in `src/main.py`) already embeds exactly this — it opens the
+> serial/BLE/TCP interface, subscribes a bound method to `meshtastic.receive`,
+> decodes with a vendored `slm_frame.parse_v2`, and energy-averages the 8 Hz feed
+> onto its 1 Hz / fast-meter buffers. **No MQTT, no broker — the app is fully
+> self-contained.** This document is kept as the reference spec for the wire
+> format and the receive pattern; it is no longer an open task.
+
+**Goal (historical):** pipe *real* SLM frames from a node into the FoH app (which
+ran on synthetic data). This document is the spec for that wiring.
 
 You do **not** need to touch the firmware or invent a wire format — both exist.
-Your job is the seam between "frames arriving off the node" and "the data
-structure the FoH app already consumes."
+The seam is between "frames arriving off the node" and "the data structure the
+FoH app consumes."
 
 ## What the node emits
 
@@ -65,7 +73,7 @@ The decode is already implemented once, in [slm_frame.py](slm_frame.py) — the
 single source of truth shared by both bridges. **Import it; don't re-implement:**
 
 ```python
-from slm_frame import CENTERS, parse_v2   # tools/ must be on sys.path
+from slm_frame import CENTERS, parse_v2   # SLM-tools/ must be on sys.path
 
 frame = parse_v2(payload_bytes)   # -> dict, or None if it isn't a v2 frame
 # {window_s, bands_hz, levels_db, peak_db, peak_hz}; CENTERS[17] == 1 kHz
@@ -110,7 +118,7 @@ Concretely:
    ```python
    from pubsub import pub
    import meshtastic.serial_interface
-   from slm_frame import parse_v2          # tools/ on sys.path
+   from slm_frame import parse_v2          # SLM-tools/ on sys.path
 
    def on_receive(packet=None, interface=None):
        dec = packet.get("decoded")
@@ -128,6 +136,15 @@ Concretely:
    `on_receive` runs on the meshtastic library's RX thread, so if the app's sink
    isn't thread-safe, hand off via a `queue.Queue` (the synthetic path may already
    do this).
+
+   > ⚠️ **pypubsub holds only a *weak* reference to the listener.** Subscribe a
+   > **module-level (or otherwise strongly-referenced) function**, as above. An
+   > inline `lambda`/closure passed straight to `pub.subscribe(...)` has no other
+   > reference, gets garbage-collected immediately, and then *silently never fires*
+   > — the node streams but nothing is ever decoded. (This exact bug bit
+   > `foh_client_bridge.py` first; it's fixed there now.) If you must pass extra
+   > state, stash it in module globals or keep a strong ref to a bound method —
+   > don't rely on a throwaway lambda.
 3. **Keep a dev fallback** — leave the synthetic generator behind a flag so the UI
    can still run with no node attached.
 
@@ -143,15 +160,15 @@ script — copy its `on_receive`/`open_interface` rather than rewriting them.
 1. Flash a node: `pio run -e seeed-xiao-s3-slm-foh -t upload` (XIAO ESP32-S3 + PDM mic).
 2. Connect it over USB. Confirm raw frames first with the reference bridge:
    ```sh
-   .venv/bin/python tools/foh_client_bridge.py --serial
+   .venv/bin/python SLM-tools/foh_client_bridge.py --serial
    ```
    You should see an ASCII spectrum updating ~8×/second (vs the MQTT path's
    once-per-window). Tap/whistle near the mic — the peak band should track.
 3. Visualize via the existing dashboard (optional, fully local):
    ```sh
-   .venv/bin/python tools/foh_client_bridge.py --serial --out-broker 127.0.0.1 \
+   .venv/bin/python SLM-tools/foh_client_bridge.py --serial --out-broker 127.0.0.1 \
        --out-user slm --out-pass slmdebug123
-   # then serve tools/ and open slm_dashboard.html (see tools/README.md)
+   # then serve SLM-tools/ and open slm_dashboard.html (see SLM-tools/README.md)
    ```
 4. Wire into the FoH app per the seam above; verify it now updates from the live
    feed at the same rate.
