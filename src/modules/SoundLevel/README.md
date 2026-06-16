@@ -5,6 +5,9 @@ audio from an external PDM microphone, runs a 31-band 1/3-octave filter bank,
 and periodically broadcasts the band levels onto the mesh as a small binary
 packet (intended for pickup by an MQTT bridge).
 
+> Porting this end-to-end pipeline to [MeshCore](https://github.com/meshcore-dev/MeshCore)?
+> See [MESHCORE_PORT.md](MESHCORE_PORT.md) for the design/implementation plan.
+
 ## What it does
 
 - Captures mono PDM audio at 48 kHz via the ESP-IDF I2S PDM-RX driver.
