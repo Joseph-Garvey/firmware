@@ -206,6 +206,116 @@ Two findings here are actionable design inputs, tracked in
 **dedup counter** (load-bearing for multi-gateway redundancy) and an optional
 **channel-busy gate** (to recover Meshtastic's politeness on a congested mesh).
 
+## Routing model: flood discovery vs directed delivery
+
+> Context: the fair critique that "we're just flooding, so we're not benefiting
+> from MeshCore." Half-true — and worth pinning down, because MeshCore's routing is
+> **reactive source-routed unicast** (DSR/AODV-flavoured), **not** RPL.
+
+What the source says (`src/Mesh.cpp`):
+
+- **Forwarding is opt-in per role.** `allowPacketForward()` returns `false` by
+  default (`Mesh.cpp:14` — *"Transport NOT enabled"*); only the **Repeater** role
+  flips it on. So a flood is relayed **only by designated repeaters**, not by every
+  node (contrast Meshtastic, where every client rebroadcasts by default).
+- **Direct packets are source-routed.** They carry an explicit `path` of node
+  hashes; a transit node forwards only if it is the next hop
+  (`self_id.isHashMatch(pkt->path, …)`, `Mesh.cpp:88`), else discards. Off-path
+  nodes stay silent — that is the airtime pruning.
+- **Paths are learned reactively from a flood.** A flood accumulates the hashes of
+  the nodes it crosses (`Mesh.cpp:332`); the destination reverses that into a path
+  and caches it (`out_path`). So **flood is MeshCore's discovery substrate** — even
+  directed routing needs an initial flood to learn the path. Flooding is not
+  "ignoring MeshCore"; skipping the directed *follow-up* is the only thing left on
+  the table.
+- **No DODAG / rank / objective function / anycast / link-cost metric** — nothing
+  RPL-like to lean on.
+
+### Flood vs. directed, visually
+
+Shared topology (`S` sensor, `Rn` repeater, `G★` gateway = repeater + internet,
+`Ln` leaf/client that does **not** relay under MeshCore):
+
+```
+            L1                       L2
+              \                     /
+   S ───────── R1 ──────────────── R2 ───────── G★
+               │
+               R3 ───── L3
+```
+
+Useful route to egress: `S → R1 → R2 → G★`. Everything else (`L1 L2 R3 L3`) is
+off-path. "TX" = nodes that key up to move one frame across the mesh:
+
+| Mode | Who transmits | TX | Note |
+| --- | --- | --- | --- |
+| **(a) Dumb broadcast** | everyone re-sends every copy, forever | ∞ | no dedup / hop-limit — a storm. **Nobody proposes this.** |
+| **(b) Managed flood — Meshtastic** | `S R1 R2 R3 L1 L2 L3` | ~7 | every node relays once (dedup + hop limit); leaves relay too |
+| **(c) Managed flood — MeshCore (our v1)** | `S R1 R2 R3` | ~4 | only **repeaters** relay; leaves stay silent — already leaner, and **not** a dumb broadcast |
+| **(d) Directed — MeshCore (optimisation)** | `S R1 R2` | 3 | path-routed to `G★`; off-path `R3` silent; minimal airtime, one gateway, needs a warm path |
+
+The progression ∞ → 7 → 4 → 3 is the point: our **default already prunes the
+leaves** (repeater-only relay), and **directed** additionally prunes the off-path
+repeater branch. The `(c) → (d)` gap — the off-path fan-out — is the *only* airtime
+a routing change can buy.
+
+### The three ways to "use the optimised routing"
+
+**Option A — Directed delivery to a chosen gateway** (the RPL-ish "nearest gateway").
+- *Native:* send a **Direct `GRP_DATA` along a learned path** —
+  `sendGroupData(channel, path, path_len, …)` already takes a path; only on-path
+  repeaters relay, and the gateway still decodes via the **channel key** (not PKI),
+  so it stays bridge-readable. Path failure auto-falls-back to flood.
+- *Not native:* true anycast across N gateways / "nearest of many" — addresses are
+  per-node pubkey hashes, no rank. Approximate it **on the sensor**: learn paths to
+  1–N gateways from their adverts, pick fewest-hops / best-SNR, re-select on
+  failure. All sensor-side, no core changes.
+- *Verdict:* the right optimisation **if airtime is the binding constraint**;
+  moderate effort, contained to our node.
+
+**Option B — Gateway terminates the flood** (the interception idea).
+- *Correction (thanks):* the intercepting node **is** the gateway (a repeater with
+  internet), so this is "a gateway uploads and stops propagating," via
+  `allowPacketForward` + `Packet::markDoNotRetransmit()` (`Packet.h:89`).
+- *Two knobs:* **upload-and-relay** (opportunistic egress — zero redundancy risk,
+  no airtime saving) vs **upload-and-suppress** (flood terminates at the egress —
+  saves the fan-out *downstream of the gateway*, mild redundancy risk if consumers
+  sit beyond it). Saving scales with how **interior** the gateway is: an edge
+  gateway (as `G★` above) has little downstream to trim; a central / cut-vertex
+  gateway saves more.
+- *Cost:* the gateway must run **repeater-role firmware** with an SLM `data_type`
+  check (stock companions never relay) — a contained infrastructure-node fork, the
+  MeshCore analog of a Meshtastic router-with-uplink.
+- *Verdict:* viable, and the better fit if you want to keep flood's discovery +
+  multi-gateway redundancy while clawing back downstream airtime. Complementary to
+  A (A prunes at the source; B trims at the sink).
+
+**Option C — Make the internet link part of MeshCore's routing cost.**
+- MeshCore has **no link-cost metric** and no non-LoRa virtual-edge concept; paths
+  are LoRa hop-hashes learned by observation, not cost-optimised. Implementing
+  "routing prefers the low-cost egress" means adding a metric-based router + a
+  virtual-link abstraction to the **core** — turning MeshCore into
+  RPL-with-heterogeneous-links.
+- *Verdict:* **not recommended** — a core rewrite against the "slap on top"
+  principle, for a benefit Option A already gets app-side.
+
+### Go / no-go (measure first)
+
+Same logic as `README.md` "Directed delivery to the gateway," which transfers
+directly:
+
+- Directed delivery saves **width** (off-path fan-out), not **depth** (still N hops
+  to egress). The `(c) → (d)` gap above *is* the prize, and it is ~zero on a
+  sparse / line mesh.
+- It only pays when **mesh-wide channel utilisation** is the binding constraint
+  **and** there are real off-path branches — a **star-of-stars is the best case**.
+- It needs **warm routes** (reactive paths decay; failures re-flood) and trades away
+  the broadcast's **free multi-gateway redundancy** (Option B keeps more of it).
+- For a 35-byte frame every ≥15 s, flood's absolute airtime may already be
+  negligible. **Ship v1 on managed flood** (mode (c): correct, redundant, simple),
+  then add Option A or B as a **measured, build-flagged** optimisation only if the
+  channel-utilisation signal says airtime is actually binding.
+
 ## Component-by-component plan
 
 ### Tier 1 — ports verbatim / near-verbatim
@@ -244,8 +354,9 @@ Two findings here are actionable design inputs, tracked in
   - Drop the `SLM_MAX_DUTY_PCT` fair-share-of-shared-tally logic — there's no
     shared per-node TX tally to carve up the same way; the node-wide dutycycle
     limiter covers the "don't hog airtime" intent more crudely.
-  - The "DM-to-gateway vs broadcast" airtime analysis in `README.md` is moot:
-    not implemented, and MeshCore's routing differs — re-derive only if needed.
+  - For the broadcast-vs-directed airtime trade, see
+    [Routing model](#routing-model-flood-discovery-vs-directed-delivery) — directed
+    delivery is a deferred, measured optimisation (Phase 5), not part of v1.
 
 ### What drops away (good riddance)
 Meshtastic's `ServiceEnvelope` protobuf, `uplink_enabled`, `mqtt.encryption_enabled`,
@@ -277,6 +388,11 @@ back-channel idea remains deferred for the same reasons as today.
    fork, e.g. `jmead/Meshcore-Repeater-MQTT-Gateway`, which publishes raw hex —
    but note its docs warn it may currently forward only ADVERTs; validate before
    relying on it). Not on the critical path while the host bridge exists.
+6. **Phase 5 — optional, measured:** routing optimisation — directed `GRP_DATA` to
+   a selected gateway (Option A) and/or gateway-side flood termination (Option B),
+   behind a build flag. Only if measurement shows mesh-wide channel utilisation is
+   the binding constraint (see
+   [Routing model](#routing-model-flood-discovery-vs-directed-delivery)).
 
 ## Open questions / risks (verify before/while coding)
 
