@@ -28,6 +28,10 @@ not just its public docs. File:line references are into that repo.
   and it's a *thin* addition: capture + frame + one `sendGroupData(...)` call on top
   of an untouched radio/mesh/crypto/routing stack. This matches the "we trust their
   radio stack, we slap SLM on top" goal.
+- **Operationally it's a lateral move, not a leap:** the same flood airtime
+  envelope, a flatter/cleaner host decode, preserved multi-gateway redundancy, and
+  one real reliability win (companion-side store-and-forward). See
+  [Operational characteristics](#operational-characteristics-dataflow-airtime-redundancy-reliability).
 
 ## Why a fork is optional (and which parts need one)
 
@@ -121,6 +125,87 @@ didn't surface to the bridge.
 - `0x0100–0xFEFF` registered app namespaces — for a real deployment, submit a PR
   to `docs/number_allocations.md` reserving one SLM value.
 
+## Operational characteristics (dataflow, airtime, redundancy, reliability)
+
+How this architecture behaves versus the current Meshtastic SLM path. Both
+broadcast a small frame over **flood routing on a shared-key channel**, so the
+fundamentals are shared; the differences live in the gateway/host hop and the
+duty-cycle machinery. Headline: **a lateral move with one real reliability win and
+a flatter dataflow, offset by minor airtime/redundancy wrinkles that our
+dedicated-sensor + host-in-the-loop topology mostly cancels.**
+
+### Dataflow — modest improvement
+- Meshtastic hands the host a nested `ServiceEnvelope → MeshPacket → Data`
+  protobuf, requires a `portnum == PRIVATE_APP` filter, and forces consuming the
+  binary `/e/` topic because JSON uplink drops unknown portnums
+  (`MeshPacketSerializer` `default:`).
+- MeshCore hands the host one `CHANNEL_DATA_RECV` (0x1B) frame already decrypted,
+  demuxed by `data_type`, and reduced to `[SNR][channel_idx][data_type][len][payload]`.
+  `parse_v2` runs directly on `payload`; SNR is a free per-frame link metric.
+- Cost: upstream MeshCore has **no node→broker path** — a host is mandatory. We
+  already chose the USB client-proxy, so this is free for us, but it removes the
+  standalone headless-WiFi-gateway option.
+
+### Airtime — roughly neutral (slightly worse on a congested channel)
+- Per-frame cost and flood fan-out are ~equal (LoRa SF/BW dominates; the 35-byte
+  payload is identical).
+- Meshtastic's `AirTime` adds a **channel-utilization** gate
+  (`isTxAllowedChannelUtil`, see `SoundLevelModule.cpp` `dutyAllows()`) that backs
+  off on mesh-wide congestion. MeshCore's `set dutycycle` throttles only our **own**
+  TX (+ CSMA `txdelay`); there is no sustained band-busy gate. So Meshtastic is the
+  more polite citizen in a busy mesh.
+- Offset: a dedicated SLM sensor has no co-resident traffic, so Meshtastic's
+  `SLM_MAX_DUTY_PCT` fair-share carve-out is largely moot here — dropping it costs
+  little.
+- Minor MeshCore regression: flood **accumulates a path** (up to `MAX_PATH_SIZE`
+  = 64 B, `packet_format.md`) as it hops, growing later-hop frames slightly; the
+  trade is cheap directed routing later.
+- No airtime *win*: the DM-to-gateway fan-out optimization (analyzed in
+  [README.md](README.md)) is equally unimplemented in both.
+
+### Redundancy — parity, but two things become our job
+- Multi-gateway still works: any in-range companion forwards to its host → N copies
+  → dedup.
+- **No packet id** in `CHANNEL_DATA_RECV` (Meshtastic dedups on `MeshPacket.id`),
+  so multi-gateway dedup requires our own frame counter in the blob — see the v3
+  bump in [Open questions](#open-questions--risks-verify-beforewhile-coding).
+- **Role split:** MeshCore Companion nodes do not repeat by design, so a
+  companion-gateway uplinks only what it directly hears. For coverage *and* uplink,
+  pair a Repeater (mesh extension) with companion(s) (uplink). Uplink redundancy is
+  unchanged; the topology is just explicit.
+
+### Reliability — the clearest win
+- The failure mode this project hit (`SLM-tools/README.md` "Findings"): Meshtastic
+  MQTT is **QoS 0, no store-and-forward** — frames arriving while the uplink is down
+  are dropped. That is why we abandoned WiFi for the client-proxy.
+- MeshCore's companion firmware **queues inbound datagrams** across a host
+  disconnect and replays them via `PUSH_CODE_MSG_WAITING` + `CMD_SYNC_NEXT_MESSAGE`
+  — store-and-forward at the gateway, the thing Meshtastic lacks. A brief host/link
+  flap no longer loses frames (finite queue; a long outage still overflows).
+- Tempering: the companion protocol is newer ("still in development"); Meshtastic's
+  MQTT is battle-tested, so current bug-surface favors Meshtastic. And the hard host
+  dependency means a dead host stops uplink (already true for the client-proxy).
+
+### Scorecard
+
+| Axis | vs current Meshtastic SLM |
+| --- | --- |
+| Dataflow | Modest improvement — flatter, pre-demuxed, +SNR; loses standalone WiFi gateway |
+| Airtime | Neutral; slight regression in congested meshes (no channel-util gate) |
+| Redundancy | Parity — needs our dedup counter + deliberate role split |
+| Reliability | Real improvement — companion store-and-forward; tempered by maturity |
+
+**Verdict:** not a dramatic upgrade — airtime and redundancy are bounded by the
+flood model, which is the same in both. We adopt MeshCore for its radio
+stack/networking; the SLM data path comes out **slightly cleaner and meaningfully
+more reliable for our host-in-the-loop topology**. One-liner: *same airtime
+envelope, simpler decode, better behavior when the uplink flaps.*
+
+Two findings here are actionable design inputs, tracked in
+[Open questions / risks](#open-questions--risks-verify-beforewhile-coding): the v3
+**dedup counter** (load-bearing for multi-gateway redundancy) and an optional
+**channel-busy gate** (to recover Meshtastic's politeness on a congested mesh).
+
 ## Component-by-component plan
 
 ### Tier 1 — ports verbatim / near-verbatim
@@ -209,6 +294,15 @@ back-channel idea remains deferred for the same reasons as today.
 - **Duty-cycle realism.** Validate that the node-wide `dutycycle` limiter + our
   `SLM_TMIN_S` actually yields the cadence we want under EU868; there's no
   channel-utilization gate to lean on like Meshtastic.
+- **Politeness gate (recover Meshtastic's channel-util backoff).** MeshCore's
+  node-wide `dutycycle` throttles only our own TX, with CSMA `txdelay` for
+  instantaneous collisions, but has no sustained "band is busy, hold off" gate like
+  Meshtastic's `isTxAllowedChannelUtil()`. On a congested shared channel this is a
+  regression (see
+  [Operational characteristics](#operational-characteristics-dataflow-airtime-redundancy-reliability)).
+  If we deploy onto a busy mesh, add an optional channel-activity check (e.g. gate
+  on recent RX airtime / RSSI-above-noise) before `sendGroupData`. Skip it on a
+  quiet, dedicated channel.
 - **ESP32-S3 + RadioLib pin/SPI coexistence.** Re-confirm the free-GPIO mic pin
   budget (D1/D2) on the MeshCore board variant — MeshCore (RadioLib) may map the
   SX1262 pins differently than this Meshtastic variant.
