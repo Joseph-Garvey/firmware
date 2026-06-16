@@ -259,6 +259,54 @@ leaves** (repeater-only relay), and **directed** additionally prunes the off-pat
 repeater branch. The `(c) → (d)` gap — the off-path fan-out — is the *only* airtime
 a routing change can buy.
 
+### Relay control: roles & defaults vs. Meshtastic
+
+A natural question: isn't MeshCore's "Repeater vs. client" just Meshtastic role
+assignment? Not quite — and the Meshtastic analog is **not** "client vs. sensor".
+In Meshtastic the rebroadcast decision is (`FloodingRouter.cpp:155`):
+
+```cpp
+isRebroadcaster() = (role != CLIENT_MUTE) && (rebroadcast_mode != NONE);
+```
+
+so **CLIENT, SENSOR, TRACKER, ROUTER, REPEATER all relay** — the `SENSOR` role
+(`NodeDB.cpp:1193`) only changes the node's *own* telemetry/power, not relaying.
+The relay knob is `CLIENT_MUTE` / `rebroadcast_mode`, giving the mapping:
+
+| MeshCore | Meshtastic equivalent |
+| --- | --- |
+| Companion / client — does **not** relay (`allowPacketForward()=false`, `Mesh.cpp:14`) | `CLIENT_MUTE` role, or `rebroadcast_mode=NONE` |
+| Repeater — relays | CLIENT / ROUTER / REPEATER (all relay by default) |
+
+**The core difference is an inverted default**, not a capability gap:
+
+- **MeshCore: relay OFF by default** — opt *in* by making a node a Repeater.
+- **Meshtastic: relay ON by default** for ~every role — opt *out* via `CLIENT_MUTE`
+  / `rebroadcast_mode=NONE`.
+
+So mode (c) vs (b) in the table above is mostly a *default*: you could mute the
+Meshtastic leaves to get (c), or make every MeshCore node a Repeater to get (b).
+
+**Two differences that are not just defaults:**
+
+1. **Selective relay — Meshtastic has more no-fork knobs.** `rebroadcast_mode`
+   offers `LOCAL_ONLY`, `KNOWN_ONLY` (only nodes in NodeDB, `Router.cpp:444`),
+   `CORE_PORTNUMS_ONLY`, `NONE`. MeshCore's `allowPacketForward()` is a plain
+   boolean — selective relay (e.g. "only SLM," or intercept-and-suppress) needs a
+   repeater fork, i.e. **Option B** above.
+2. **Payload-agnostic repeater — favors us.** Meshtastic's **ROUTER role defaults
+   to `CORE_PORTNUMS_ONLY`** (`NodeDB.cpp:1186`), which **silently drops
+   non-standard portnums** (`Router.cpp:780-795`; allowlist = NodeInfo / Text /
+   Position / Telemetry / Routing). **`PRIVATE_APP` is not on it**, so a Meshtastic
+   router refuses to relay SLM frames unless set back to `ALL`. A **stock MeshCore
+   Repeater relays every payload type, including `GRP_DATA`** — no portnum
+   allowlist. For a custom-payload sensor this is a real MeshCore advantage.
+
+**Upshot:** on MeshCore, leave meters as default companions (silent) and make a few
+infra nodes Repeaters — they relay `GRP_DATA` with no per-node fiddling. The same
+topology on Meshtastic infra would need the leaves muted *and* the relays kept off
+the ROUTER `CORE_PORTNUMS_ONLY` default — two easy-to-miss steps MeshCore avoids.
+
 ### The three ways to "use the optimised routing"
 
 **Option A — Directed delivery to a chosen gateway** (the RPL-ish "nearest gateway").
